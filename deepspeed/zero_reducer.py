@@ -267,6 +267,40 @@ class Zero1or2Reducer:
                 return
         raise RuntimeError("No available IPG buffer after finalizing pending communication.")
 
+    def _stage2_pending_limit(self) -> int:
+        # Bound in-flight stage2 items to the pipeline depth implied by reducer buffers.
+        # Without this, async packed collectives can accumulate through the whole backward.
+        return max(1, len(self._ipg_buffers))
+
+    def _enqueue_stage2_item(
+        self,
+        *,
+        buffer_idx: Optional[int],
+        holds_buffer: bool,
+        chunks: List[Dict[str, Any]],
+        pieces: List[Tuple[int, int, int, int]],
+        async_flag: bool,
+    ):
+        item = {
+            "kind": "stage2",
+            "buffer_idx": buffer_idx,
+            "holds_buffer": holds_buffer,
+            "chunks": chunks,
+            "pieces": pieces,
+        }
+        if async_flag and buffer_idx is not None and holds_buffer:
+            self._busy_buffers.add(buffer_idx)
+        self._pending.append(item)
+        if not async_flag:
+            self._finalize_oldest_pending()
+            return
+
+        # Keep async stage2 pending memory bounded; drain oldest completed work
+        # instead of deferring all finalization to backward_epilogue().
+        limit = self._stage2_pending_limit()
+        while len(self._pending) > limit:
+            self._finalize_oldest_pending()
+
     @torch.no_grad()
     def _flush_active_bucket(self):
         if self._ipg_elements == 0:
@@ -363,11 +397,8 @@ class Zero1or2Reducer:
     def _launch_stage2_bucket(self, bucket_tensor: torch.Tensor, entries: List[_IPGParamEntry], buffer_idx: Optional[int]):
         pieces = self._stage2_build_rank_and_offsets(entries)
         async_flag = self._use_async_collective()
-        chunks: List[Dict[str, Any]] = []
-        holds_buffer = True
 
         if self.reduce_scatter and dist.is_initialized() and self.world_size > 1:
-            holds_buffer = False
             small: List[Tuple[int, int, int, int]] = []
             numel = 0
 
@@ -384,7 +415,13 @@ class Zero1or2Reducer:
                     meta.append((int(dst), int(off), int(n), int(part_off)))
                     off += n
                 work = self._launch_all_reduce(packed, async_op=async_flag)
-                chunks.append({"tensor": packed, "work": work, "meta": meta})
+                self._enqueue_stage2_item(
+                    buffer_idx=buffer_idx,
+                    holds_buffer=False,
+                    chunks=[{"tensor": packed, "work": work, "meta": meta}],
+                    pieces=[],
+                    async_flag=async_flag,
+                )
                 small = []
                 numel = 0
 
@@ -394,22 +431,16 @@ class Zero1or2Reducer:
                 if numel >= self.reduce_bucket_size:
                     _flush_small()
             _flush_small()
-        else:
-            work = self._launch_all_reduce(bucket_tensor, async_op=async_flag)
-            chunks.append({"tensor": bucket_tensor, "work": work, "meta": None})
+            return
 
-        item = {
-            "kind": "stage2",
-            "buffer_idx": buffer_idx,
-            "holds_buffer": holds_buffer,
-            "chunks": chunks,
-            "pieces": pieces,
-        }
-        if async_flag and buffer_idx is not None and item["holds_buffer"]:
-            self._busy_buffers.add(buffer_idx)
-        self._pending.append(item)
-        if not async_flag:
-            self._finalize_oldest_pending()
+        work = self._launch_all_reduce(bucket_tensor, async_op=async_flag)
+        self._enqueue_stage2_item(
+            buffer_idx=buffer_idx,
+            holds_buffer=True,
+            chunks=[{"tensor": bucket_tensor, "work": work, "meta": None}],
+            pieces=pieces,
+            async_flag=async_flag,
+        )
 
     def _finalize_stage1_item(self, item: Dict[str, Any]):
         if item.get("partition_aware", False):
