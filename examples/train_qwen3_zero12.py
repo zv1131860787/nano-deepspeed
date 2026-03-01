@@ -1,16 +1,14 @@
 import argparse
+import importlib
+import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-import deepspeed
 
 
 def _dist_required() -> bool:
@@ -119,9 +117,72 @@ def _extract_loss(outputs) -> torch.Tensor:
     raise RuntimeError("Model outputs do not contain a loss tensor. Ensure labels are passed to the model.")
 
 
+def _load_deepspeed_impl(impl: str):
+    repo_root = Path(__file__).resolve().parents[1]
+    if impl == "nano":
+        alias = "nano_deepspeed"
+        if alias in sys.modules:
+            return sys.modules[alias]
+
+        pkg_dir = repo_root / "deepspeed"
+        init_py = pkg_dir / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            alias,
+            init_py,
+            submodule_search_locations=[str(pkg_dir)],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load local deepspeed package from {init_py}")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    # official
+    original_sys_path = list(sys.path)
+    repo_root_str = str(repo_root.resolve())
+    examples_dir_str = str((repo_root / "examples").resolve())
+    filtered = []
+    for p in original_sys_path:
+        rp = str(Path(p).resolve()) if p else ""
+        if p == "":
+            continue
+        if rp in (repo_root_str, examples_dir_str):
+            continue
+        filtered.append(p)
+
+    sys.path = filtered
+    try:
+        mod = importlib.import_module("deepspeed")
+    finally:
+        sys.path = original_sys_path
+
+    mod_path = str(Path(getattr(mod, "__file__", "")).resolve())
+    if mod_path.startswith(repo_root_str):
+        raise RuntimeError(
+            "Requested --ds-impl=official, but imported local repo package instead. "
+            "Run this script from outside the repo root, or adjust PYTHONPATH."
+        )
+    return mod
+
+
+def _max_across_ranks(value: float, device: torch.device) -> float:
+    if not dist.is_initialized():
+        return float(value)
+    t = torch.tensor(float(value), device=device, dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser = deepspeed.add_config_arguments(parser)
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--ds-impl", type=str, default="nano", choices=["nano", "official"])
+    boot_args, _ = bootstrap.parse_known_args()
+
+    ds = _load_deepspeed_impl(boot_args.ds_impl)
+
+    parser = argparse.ArgumentParser(parents=[bootstrap])
+    parser = ds.add_config_arguments(parser)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -148,7 +209,7 @@ def main():
 
     dist_required = _dist_required()
     if dist_required:
-        deepspeed.init_distributed()
+        ds.init_distributed()
 
     torch.manual_seed(args.seed)
 
@@ -167,9 +228,11 @@ def main():
 
     model, tokenizer, model_dtype = _load_qwen3(args, device)
     if rank == 0:
+        ds_file = str(Path(getattr(ds, "__file__", "unknown")).resolve())
+        print(f"[deepspeed] impl={args.ds_impl} module={ds_file}")
         print(f"[model] loaded {args.model_name} on {device} (param_dtype={model_dtype})")
 
-    engine, _, _, _ = deepspeed.initialize(
+    engine, _, _, _ = ds.initialize(
         args=args,
         model=model,
         model_parameters=model.parameters(),
@@ -186,6 +249,8 @@ def main():
     grad_accum = int(ds_cfg.get("gradient_accumulation_steps", 1))
     engine.zero_grad(set_to_none=True)
     last_loss = None
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device=device)
 
     for step in range(args.steps):
         input_ids, attention_mask, labels = _build_batch(
@@ -218,6 +283,20 @@ def main():
         if rank == 0 and last_loss is not None:
             opt_step = (args.steps + grad_accum - 1) // grad_accum
             print(f"[opt_step {opt_step}] loss={last_loss.item():.4f} (tail_flush {tail_micro}/{grad_accum})")
+
+    peak_mem_mb = 0.0
+    if device.type == "cuda":
+        peak_mem_mb = float(torch.cuda.max_memory_allocated(device=device) / (1024.0 * 1024.0))
+    peak_mem_mb = _max_across_ranks(peak_mem_mb, device=device)
+    if rank == 0:
+        metrics = {
+            "ds_impl": args.ds_impl,
+            "steps": int(args.steps),
+            "zero_stage": int((ds_cfg.get("zero_optimization", {}) or {}).get("stage", 0)),
+            "peak_mem_mb_max_rank": round(peak_mem_mb, 2),
+            "last_loss": None if last_loss is None else float(last_loss.item()),
+        }
+        print("[metrics] " + json.dumps(metrics, sort_keys=True))
 
     if dist.is_initialized():
         dist.barrier()
