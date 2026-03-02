@@ -124,7 +124,7 @@ def _load_deepspeed_impl(impl: str):
         if alias in sys.modules:
             return sys.modules[alias]
 
-        pkg_dir = repo_root / "deepspeed"
+        pkg_dir = repo_root / "nano_deepspeed"
         init_py = pkg_dir / "__init__.py"
         spec = importlib.util.spec_from_file_location(
             alias,
@@ -232,13 +232,19 @@ def main():
         print(f"[deepspeed] impl={args.ds_impl} module={ds_file}")
         print(f"[model] loaded {args.model_name} on {device} (param_dtype={model_dtype})")
 
-    engine, _, _, _ = ds.initialize(
-        args=args,
-        model=model,
-        model_parameters=model.parameters(),
-        config=ds_cfg,
-        dist_init_required=dist_required,
-    )
+    init_kwargs = {
+        "args": args,
+        "model": model,
+        "model_parameters": model.parameters(),
+        "dist_init_required": dist_required,
+    }
+    if args.ds_impl == "official":
+        # Official DeepSpeed expects config from exactly one source.
+        # We keep it on args.deepspeed_config and do not pass `config=...`.
+        args.deepspeed_config = ds_cfg
+        engine, _, _, _ = ds.initialize(**init_kwargs)
+    else:
+        engine, _, _, _ = ds.initialize(config=ds_cfg, **init_kwargs)
 
     # Keep optimizer/dropout deterministic across ranks, but decorrelate tokenized prompts.
     data_seed = int(args.seed) + 1000 + int(rank)

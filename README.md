@@ -16,16 +16,16 @@
 
 ### 2.1 训练入口与 API 兼容层
 
-- `deepspeed.add_config_arguments(parser)`
-- `deepspeed.init_distributed(...)`
-- `deepspeed.initialize(...)`
-- `deepspeed.zero.Init`（兼容 stub，支持 ZeRO-1/2 场景下的基本进入/退出）
+- `nano_deepspeed.add_config_arguments(parser)`
+- `nano_deepspeed.init_distributed(...)`
+- `nano_deepspeed.initialize(...)`
+- `nano_deepspeed.zero.Init`（兼容 stub，支持 ZeRO-1/2 场景下的基本进入/退出）
 
 对应文件：
 
-- `deepspeed/api.py`
-- `deepspeed/distributed.py`
-- `deepspeed/zero/__init__.py`
+- `nano_deepspeed/api.py`
+- `nano_deepspeed/distributed.py`
+- `nano_deepspeed/zero/__init__.py`
 
 ### 2.2 ZeRO 优化器核心能力
 
@@ -38,9 +38,9 @@
 
 对应文件：
 
-- `deepspeed/zero_optimizer.py`
-- `deepspeed/fp16_scaler.py`
-- `deepspeed/zero_types.py`
+- `nano_deepspeed/zero_optimizer.py`
+- `nano_deepspeed/fp16_scaler.py`
+- `nano_deepspeed/zero_types.py`
 
 ### 2.3 ZeRO-1/2 梯度规约器（重点）
 
@@ -53,15 +53,19 @@
 
 对应文件：
 
-- `deepspeed/zero_reducer.py`
-- `deepspeed/utils.py`
+- `nano_deepspeed/zero_reducer.py`
+- `nano_deepspeed/utils.py`
 
 ### 2.4 可用于对比实验的示例脚本
 
-`examples/train_qwen3_zero12.py` 支持同一脚本切换两种实现：
+推荐使用两个独立入口脚本：
 
-- `--ds-impl nano`：加载本仓库教学版 deepspeed
-- `--ds-impl official`：加载已安装的官方 deepspeed
+- `examples/train_qwen3_zero12_nano.py`：加载本仓库教学版 `nano_deepspeed`
+- `examples/train_qwen3_zero12_official.py`：加载已安装的官方 `deepspeed`
+
+兼容入口：
+
+- `examples/train_qwen3_zero12.py` 仍支持 `--ds-impl nano|official` 切换。
 
 脚本会输出：
 
@@ -73,7 +77,7 @@
 
 ```text
 .
-├── deepspeed/
+├── nano_deepspeed/
 │   ├── __init__.py
 │   ├── api.py
 │   ├── config.py
@@ -88,7 +92,9 @@
 │       └── __init__.py
 └── examples/
     ├── ds_config_zero2.json
-    └── train_qwen3_zero12.py
+    ├── train_qwen3_zero12.py
+    ├── train_qwen3_zero12_nano.py
+    └── train_qwen3_zero12_official.py
 ```
 
 ## 4. 环境要求
@@ -115,8 +121,7 @@ pip install deepspeed
 ### 5.1 单卡快速跑通（教学版）
 
 ```bash
-python3 examples/train_qwen3_zero12.py \
-  --ds-impl nano \
+python3 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config examples/ds_config_zero2.json \
   --steps 5 \
   --batch-size 1 \
@@ -126,8 +131,7 @@ python3 examples/train_qwen3_zero12.py \
 ### 5.2 多卡运行（推荐用 torchrun）
 
 ```bash
-torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12.py \
-  --ds-impl nano \
+torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config examples/ds_config_zero2.json \
   --steps 20
 ```
@@ -139,8 +143,7 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12.py \
 ### 6.1 跑教学版
 
 ```bash
-torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12.py \
-  --ds-impl nano \
+torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config examples/ds_config_zero2.json \
   --steps 20
 ```
@@ -148,8 +151,7 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12.py \
 ### 6.2 跑官方版
 
 ```bash
-torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12.py \
-  --ds-impl official \
+torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
   --deepspeed_config examples/ds_config_zero2.json \
   --steps 20
 ```
@@ -225,9 +227,9 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12.py \
 
 ## 11. 常见问题
 
-### Q1：为什么 `--ds-impl official` 可能导入失败？
+### Q1：为什么官方脚本可能导入失败？
 
-因为脚本会主动检查你是否误导入了仓库内本地包。确保环境里已安装官方 deepspeed，并避免 `PYTHONPATH` 把当前仓库覆盖到官方包前面。
+确保环境里已安装官方 `deepspeed`，并确认没有把其他同名本地包放到 `PYTHONPATH` 前面。若你使用兼容入口 `train_qwen3_zero12.py --ds-impl official`，同样要避免同名覆盖。
 
 ### Q2：为什么会报 `Unused parameter detected during ZeRO gradient reduction`？
 
