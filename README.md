@@ -63,10 +63,6 @@
 - `examples/train_qwen3_zero12_nano.py`：加载本仓库教学版 `nano_deepspeed`
 - `examples/train_qwen3_zero12_official.py`：加载已安装的官方 `deepspeed`
 
-兼容入口：
-
-- `examples/train_qwen3_zero12.py` 仍支持 `--ds-impl nano|official` 切换。
-
 脚本会输出：
 
 - 当前实现来源（module 路径）
@@ -92,7 +88,6 @@
 │       └── __init__.py
 └── examples/
     ├── ds_config_zero2.json
-    ├── train_qwen3_zero12.py
     ├── train_qwen3_zero12_nano.py
     └── train_qwen3_zero12_official.py
 ```
@@ -102,7 +97,7 @@
 - Python 3.9+
 - PyTorch（建议 CUDA 版本）
 - transformers（用于 Qwen 示例）
-- 官方 DeepSpeed（仅在你要跑 `--ds-impl official` 时需要）
+- 官方 DeepSpeed（仅在你要跑 `train_qwen3_zero12_official.py` 时需要）
 
 示例安装：
 
@@ -229,7 +224,7 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py
 
 ### Q1：为什么官方脚本可能导入失败？
 
-确保环境里已安装官方 `deepspeed`，并确认没有把其他同名本地包放到 `PYTHONPATH` 前面。若你使用兼容入口 `train_qwen3_zero12.py --ds-impl official`，同样要避免同名覆盖。
+确保环境里已安装官方 `deepspeed`，并确认没有把其他同名本地包放到 `PYTHONPATH` 前面。
 
 ### Q2：为什么会报 `Unused parameter detected during ZeRO gradient reduction`？
 
