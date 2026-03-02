@@ -123,6 +123,21 @@ def _max_across_ranks(value: float, device: torch.device) -> float:
     return float(t.item())
 
 
+def _engine_zero_grad_compat(engine):
+    try:
+        engine.zero_grad(set_to_none=True)
+    except TypeError:
+        engine.zero_grad()
+
+
+def _engine_force_step_compat(engine) -> bool:
+    try:
+        engine.step(force=True)
+        return True
+    except TypeError:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser = ds.add_config_arguments(parser)
@@ -191,7 +206,7 @@ def main():
         torch.cuda.manual_seed(data_seed)
 
     grad_accum = int(ds_cfg.get("gradient_accumulation_steps", 1))
-    engine.zero_grad(set_to_none=True)
+    _engine_zero_grad_compat(engine)
     last_loss = None
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device=device)
@@ -223,10 +238,13 @@ def main():
 
     tail_micro = getattr(engine, "_micro_steps", 0) % grad_accum
     if tail_micro != 0:
-        engine.step(force=True)
-        if rank == 0 and last_loss is not None:
-            opt_step = (args.steps + grad_accum - 1) // grad_accum
-            print(f"[opt_step {opt_step}] loss={last_loss.item():.4f} (tail_flush {tail_micro}/{grad_accum})")
+        did_tail_flush = _engine_force_step_compat(engine)
+        if rank == 0:
+            if did_tail_flush and last_loss is not None:
+                opt_step = (args.steps + grad_accum - 1) // grad_accum
+                print(f"[opt_step {opt_step}] loss={last_loss.item():.4f} (tail_flush {tail_micro}/{grad_accum})")
+            else:
+                print("[warn] engine.step(force=True) is not supported by this DeepSpeed version; tail flush skipped.")
 
     peak_mem_mb = 0.0
     if device.type == "cuda":
