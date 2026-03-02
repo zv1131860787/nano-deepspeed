@@ -68,6 +68,7 @@
 - 当前实现来源（module 路径）
 - loss 日志
 - `peak_mem_mb_max_rank`（多卡下跨 rank 取最大峰值显存）
+- `peak_reserved_mb_max_rank`（多卡下跨 rank 取最大保留显存）
 
 ## 3. 目录结构
 
@@ -88,6 +89,7 @@
 │       └── __init__.py
 └── examples/
     ├── ds_config_zero2.json
+    ├── ds_config_zero2_official.json
     ├── train_qwen3_zero12_nano.py
     └── train_qwen3_zero12_official.py
 ```
@@ -139,7 +141,7 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
 
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
-  --deepspeed_config examples/ds_config_zero2.json \
+  --deepspeed_config examples/ds_config_zero2_official.json \
   --steps 20
 ```
 
@@ -147,7 +149,7 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
 
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
-  --deepspeed_config examples/ds_config_zero2.json \
+  --deepspeed_config examples/ds_config_zero2_official.json \
   --steps 20
 ```
 
@@ -156,10 +158,39 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py
 关注日志中的 `[metrics]` 行，例如：
 
 ```text
-[metrics] {"ds_impl":"nano","last_loss":...,"peak_mem_mb_max_rank":...,"steps":20,"zero_stage":2}
+[metrics] {"ds_impl":"nano","last_loss":...,"peak_mem_mb_max_rank":...,"peak_reserved_mb_max_rank":...,"steps":20,"zero_stage":2}
 ```
 
-对比 `peak_mem_mb_max_rank` 即可。
+建议同时对比：
+
+- `peak_mem_mb_max_rank`（allocated）
+- `peak_reserved_mb_max_rank`（reserved）
+
+### 6.4 严格对齐对比命令（推荐）
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+CONF=examples/ds_config_zero2_official.json
+MODEL=/root/autodl-tmp/pretrained_models/Qwen3-0.6B
+
+# 可选 warmup，减少首次编译/JIT 对峰值的干扰
+torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
+  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 --steps 2 >/dev/null
+
+torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
+  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 --steps 2 >/dev/null
+
+# 正式对比
+torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
+  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
+  --batch-size 1 --seq-len 128 --steps 20 | tee nano.log
+
+torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
+  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
+  --batch-size 1 --seq-len 128 --steps 20 | tee official.log
+
+grep "\\[metrics\\]" nano.log official.log
+```
 
 ## 7. 教学实现的主线心智模型
 
@@ -188,6 +219,10 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py
 - `communication_data_type`：通信 dtype（fp16/fp32/bf16）
 - `stage1_partition_aware_grad_reduce`：stage1 是否按分片感知规约
 - `ignore_unused_parameters`：是否把未产 grad 参数按 0 处理
+
+说明：
+
+- `train_qwen3_zero12_official.py` 请使用 `examples/ds_config_zero2_official.json`，该文件去除了官方 DeepSpeed 不接受的自定义字段。
 
 ## 9. 与官方 DeepSpeed 的差距（重点）
 

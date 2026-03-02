@@ -249,15 +249,19 @@ def main():
             print(f"[opt_step {opt_step}] loss={last_loss.item():.4f} (tail_flush {tail_micro}/{grad_accum})")
 
     peak_mem_mb = 0.0
+    peak_reserved_mb = 0.0
     if device.type == "cuda":
         peak_mem_mb = float(torch.cuda.max_memory_allocated(device=device) / (1024.0 * 1024.0))
+        peak_reserved_mb = float(torch.cuda.max_memory_reserved(device=device) / (1024.0 * 1024.0))
     peak_mem_mb = _max_across_ranks(peak_mem_mb, device=device)
+    peak_reserved_mb = _max_across_ranks(peak_reserved_mb, device=device)
     if rank == 0:
         metrics = {
             "ds_impl": "nano",
             "steps": int(args.steps),
             "zero_stage": int((ds_cfg.get("zero_optimization", {}) or {}).get("stage", 0)),
             "peak_mem_mb_max_rank": round(peak_mem_mb, 2),
+            "peak_reserved_mb_max_rank": round(peak_reserved_mb, 2),
             "last_loss": None if last_loss is None else float(last_loss.item()),
         }
         print("[metrics] " + json.dumps(metrics, sort_keys=True))
