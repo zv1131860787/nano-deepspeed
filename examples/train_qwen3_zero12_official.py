@@ -71,7 +71,7 @@ def _configure_deepspeed_precision(ds_cfg, *, model_dtype: torch.dtype, device: 
 
 def _load_qwen3(args, device: torch.device):
     try:
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
             "This example requires `transformers`. Install it first, e.g. `pip install transformers`."
@@ -93,32 +93,26 @@ def _load_qwen3(args, device: torch.device):
             )
         tokenizer.pad_token = tokenizer.eos_token
 
-    model_config = AutoConfig.from_pretrained(
-        args.model_name,
-        trust_remote_code=args.trust_remote_code,
-        local_files_only=args.local_files_only,
-    )
     attn_impl = "default"
     flash_fallback_reason = None
+    model_load_kwargs = {
+        "trust_remote_code": args.trust_remote_code,
+        "local_files_only": args.local_files_only,
+        "torch_dtype": torch.float32,
+    }
     if device.type == "cuda":
         try:
-            model = AutoModelForCausalLM.from_config(
-                model_config,
-                trust_remote_code=args.trust_remote_code,
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name,
                 attn_implementation="flash_attention_2",
+                **model_load_kwargs,
             )
             attn_impl = "flash_attention_2"
         except Exception as exc:
             flash_fallback_reason = str(exc).strip().splitlines()[0]
-            model = AutoModelForCausalLM.from_config(
-                model_config,
-                trust_remote_code=args.trust_remote_code,
-            )
+            model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs)
     else:
-        model = AutoModelForCausalLM.from_config(
-            model_config,
-            trust_remote_code=args.trust_remote_code,
-        )
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs)
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
@@ -532,7 +526,7 @@ def main():
         ds_file = str(Path(getattr(ds, "__file__", "unknown")).resolve())
         print(f"[deepspeed] impl=official module={ds_file}")
         print(
-            f"[model] initialized {args.model_name} from config on {device} "
+            f"[model] loaded pretrained {args.model_name} on {device} "
             f"(param_dtype={param_dtype}, compute_dtype={model_dtype}, ds_precision={ds_precision_mode}, attention={attn_impl})"
         )
         if flash_fallback_reason is not None:
