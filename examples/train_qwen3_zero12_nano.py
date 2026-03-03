@@ -51,14 +51,13 @@ def _resolve_user_path(path_value: str, script_dir: Path) -> str:
         return str(p)
 
     candidates = [
+        p,
         Path.cwd() / p,
         script_dir / p,
         script_dir.parent / p,
     ]
-    if p.parts and p.parts[0] == script_dir.name:
-        if len(p.parts) > 1:
-            candidates.append(script_dir / Path(*p.parts[1:]))
-        candidates.append(script_dir.parent / Path(*p.parts))
+    if p.parts and p.parts[0] == script_dir.name and len(p.parts) > 1:
+        candidates.append(script_dir / Path(*p.parts[1:]))
 
     seen = set()
     for cand in candidates:
@@ -70,7 +69,10 @@ def _resolve_user_path(path_value: str, script_dir: Path) -> str:
         if c.exists():
             return key
 
-    return str((script_dir / p).resolve())
+    # Last-resort fallback: keep user-relative semantics (avoid `examples/examples/...`).
+    if p.parts and p.parts[0] == script_dir.name and len(p.parts) > 1:
+        return str((script_dir / Path(*p.parts[1:])).resolve())
+    return str((Path.cwd() / p).resolve())
 
 
 def _resolve_model_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
@@ -523,6 +525,10 @@ def main():
         torch.cuda.reset_peak_memory_stats(device)
 
     torch.manual_seed(args.seed)
+
+    if rank == 0:
+        print(f"[path] deepspeed_config={args.deepspeed_config}")
+        print(f"[path] dataset_path={args.dataset_path}")
 
     with open(args.deepspeed_config, "r", encoding="utf-8") as f:
         ds_cfg = json.load(f)
