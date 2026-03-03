@@ -100,7 +100,7 @@ def _load_qwen3(args, device: torch.device):
         "local_files_only": args.local_files_only,
         "torch_dtype": torch.float32,
     }
-    requested_attn = str(getattr(args, "attn_impl", "eager")).strip().lower()
+    requested_attn = str(getattr(args, "attn_impl", "auto")).strip().lower()
 
     def _load_model(attn_name=None):
         kwargs = dict(model_load_kwargs)
@@ -116,6 +116,16 @@ def _load_qwen3(args, device: torch.device):
             flash_fallback_reason = str(exc).strip().splitlines()[0]
             model = _load_model(None)
             attn_impl = "default"
+    elif requested_attn == "sdpa":
+        try:
+            model = _load_model("sdpa")
+            attn_impl = "sdpa"
+        except Exception as exc:
+            reason = str(exc).strip().splitlines()[0]
+            raise RuntimeError(
+                "Requested --attn-impl=sdpa but initialization failed. "
+                f"Reason: {reason}"
+            ) from exc
     elif requested_attn == "flash_attention_2":
         if device.type != "cuda":
             raise RuntimeError("--attn-impl=flash_attention_2 requires CUDA.")
@@ -136,11 +146,15 @@ def _load_qwen3(args, device: torch.device):
             except Exception as exc:
                 flash_fallback_reason = str(exc).strip().splitlines()[0]
                 try:
-                    model = _load_model("eager")
-                    attn_impl = "eager"
+                    model = _load_model("sdpa")
+                    attn_impl = "sdpa"
                 except Exception:
-                    model = _load_model(None)
-                    attn_impl = "default"
+                    try:
+                        model = _load_model("eager")
+                        attn_impl = "eager"
+                    except Exception:
+                        model = _load_model(None)
+                        attn_impl = "default"
         else:
             model = _load_model(None)
             attn_impl = "default"
@@ -442,6 +456,50 @@ def _mean_tensor_across_ranks(value: torch.Tensor, device: torch.device) -> floa
     return float(t.item())
 
 
+def _any_true_across_ranks(flag: bool, device: torch.device) -> bool:
+    if not dist.is_initialized():
+        return bool(flag)
+    t = torch.tensor(1 if flag else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return bool(t.item() > 0)
+
+
+def _all_true_across_ranks(flag: bool, device: torch.device) -> bool:
+    if not dist.is_initialized():
+        return bool(flag)
+    t = torch.tensor(1 if flag else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(t, op=dist.ReduceOp.MIN)
+    return bool(t.item() > 0)
+
+
+def _set_attention_implementation(module, attn_impl: str) -> bool:
+    if hasattr(module, "set_attn_implementation"):
+        try:
+            module.set_attn_implementation(attn_impl)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _nonfinite_param_summary(module, *, max_names: int = 3):
+    bad_param_tensors = 0
+    bad_param_elements = 0
+    bad_names = []
+    for name, p in module.named_parameters():
+        if p is None:
+            continue
+        data = p.detach()
+        finite = torch.isfinite(data)
+        if bool(finite.all()):
+            continue
+        bad_param_tensors += 1
+        bad_param_elements += int((~finite).sum().item())
+        if len(bad_names) < max_names:
+            bad_names.append(name)
+    return bad_param_tensors, bad_param_elements, bad_names
+
+
 def _engine_zero_grad_compat(engine):
     try:
         engine.zero_grad(set_to_none=True)
@@ -509,8 +567,8 @@ def main():
     parser.add_argument(
         "--attn-impl",
         type=str,
-        default="eager",
-        choices=["eager", "auto", "flash_attention_2"],
+        default="auto",
+        choices=["eager", "sdpa", "auto", "flash_attention_2"],
     )
     parser.add_argument("--dataset-path", type=str, default="data/lima.json")
     parser.add_argument("--max-samples", type=int, default=0)
@@ -627,22 +685,71 @@ def main():
             if attn_impl == "flash_attention_2"
             else attention_mask
         )
-
         outputs = engine(
             input_ids=input_ids,
             attention_mask=attention_mask_for_model,
             labels=labels,
         )
         loss = _extract_loss(outputs)
-        if not bool(torch.isfinite(loss.detach()).all()):
+
+        flash_fallback_attempted = False
+        flash_fallback_succeeded = False
+        non_finite = _any_true_across_ranks(not bool(torch.isfinite(loss.detach()).all()), device=device)
+        if non_finite and attn_impl == "flash_attention_2":
+            flash_fallback_attempted = True
+            switched = _set_attention_implementation(engine.module, "sdpa")
+            switched_all = _all_true_across_ranks(switched, device=device)
+            if switched_all:
+                attn_impl = "sdpa"
+                if rank == 0:
+                    print(
+                        f"[warn] non-finite loss detected at step={step + 1} with flash_attention_2; "
+                        "switching to sdpa attention and retrying this step."
+                    )
+                outputs = engine(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                loss = _extract_loss(outputs)
+                non_finite = _any_true_across_ranks(not bool(torch.isfinite(loss.detach()).all()), device=device)
+                flash_fallback_succeeded = not non_finite
+                if flash_fallback_succeeded and rank == 0:
+                    print(
+                        f"[diag] step={step + 1} root_cause=flash_attention_2_forward_instability "
+                        "recovered_by=sdpa"
+                    )
+
+        if non_finite:
             valid_label_tokens = int((labels != -100).sum().item())
             max_input_id = int(input_ids.max().item()) if input_ids.numel() > 0 else -1
+            bad_param_tensors, bad_param_elements, bad_param_names = _nonfinite_param_summary(engine.module)
+            lr = float("nan")
+            try:
+                opt = getattr(engine, "optimizer", None)
+                if opt is not None and getattr(opt, "param_groups", None):
+                    lr = float(opt.param_groups[0].get("lr", float("nan")))
+            except Exception:
+                pass
+
+            root_hints = []
+            if bad_param_tensors > 0:
+                root_hints.append("model_params_non_finite_before_backward")
+            if flash_fallback_attempted and not flash_fallback_succeeded:
+                root_hints.append("flash_to_sdpa_fallback_failed")
+            if attn_impl == "flash_attention_2":
+                root_hints.append("flash_attention_2_forward_non_finite")
+            if not root_hints:
+                root_hints.append("unknown_numerical_instability")
+
             raise RuntimeError(
                 "Non-finite loss detected before backward. "
                 f"step={step + 1} valid_label_tokens={valid_label_tokens} max_input_id={max_input_id} "
                 f"attention={attn_impl} compute_dtype={model_dtype} ds_precision={ds_precision_mode} "
-                "flash_runtime_fallback_used=False. "
-                "Try rerun with --attn-impl eager."
+                f"lr={lr} flash_fallback_attempted={flash_fallback_attempted} "
+                f"flash_fallback_succeeded={flash_fallback_succeeded} "
+                f"bad_param_tensors={bad_param_tensors} bad_param_elements={bad_param_elements} "
+                f"bad_param_names={bad_param_names} root_cause_hint={root_hints}"
             )
         reduced_loss = _mean_tensor_across_ranks(loss, device=device)
         last_loss = reduced_loss
