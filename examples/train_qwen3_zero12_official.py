@@ -293,6 +293,24 @@ def _mean_tensor_across_ranks(value: torch.Tensor, device: torch.device) -> floa
     return float(t.item())
 
 
+def _max_float_across_ranks(value: float, device: torch.device) -> float:
+    t = torch.tensor(float(value), device=device, dtype=torch.float32)
+    if dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
+
+
+def _cuda_mem_stats(device: torch.device):
+    if device.type != "cuda":
+        return None
+    return {
+        "allocated_mb": torch.cuda.memory_allocated(device) / (1024.0 * 1024.0),
+        "reserved_mb": torch.cuda.memory_reserved(device) / (1024.0 * 1024.0),
+        "peak_allocated_mb": torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0),
+        "peak_reserved_mb": torch.cuda.max_memory_reserved(device) / (1024.0 * 1024.0),
+    }
+
+
 def _engine_zero_grad(engine):
     try:
         engine.zero_grad(set_to_none=True)
@@ -447,6 +465,7 @@ def main():
     )
     if device.type == "cuda":
         torch.cuda.set_device(device)
+        torch.cuda.reset_peak_memory_stats(device)
 
     torch.manual_seed(args.seed)
 
@@ -470,6 +489,10 @@ def main():
     if rank == 0:
         print(f"[script] path={Path(__file__).resolve()}")
         print(f"[deepspeed] impl=official module={Path(getattr(ds, '__file__', 'unknown')).resolve()}")
+        if device.type == "cuda":
+            props = torch.cuda.get_device_properties(device)
+            total_gb = props.total_memory / (1024.0 * 1024.0 * 1024.0)
+            print(f"[cuda] device={props.name} total_mem_gb={total_gb:.2f}")
         print(
             f"[model] {args.model_name} compute_dtype={model_dtype} ds_precision={ds_precision} attention={attn_impl}"
         )
@@ -538,10 +561,40 @@ def main():
         if (step + 1) % grad_accum == 0:
             opt_step = (step + 1) // grad_accum
             opt_loss = opt_loss_sum / max(opt_micro_count, 1)
+            mem = _cuda_mem_stats(device)
+            if mem is not None:
+                alloc_mb_max = _max_float_across_ranks(mem["allocated_mb"], device)
+                reserved_mb_max = _max_float_across_ranks(mem["reserved_mb"], device)
+                peak_alloc_mb_max = _max_float_across_ranks(mem["peak_allocated_mb"], device)
+                peak_reserved_mb_max = _max_float_across_ranks(mem["peak_reserved_mb"], device)
+            else:
+                alloc_mb_max = None
+                reserved_mb_max = None
+                peak_alloc_mb_max = None
+                peak_reserved_mb_max = None
             if rank == 0:
-                print(f"[opt_step {opt_step}] loss={opt_loss:.4f}")
+                if alloc_mb_max is None:
+                    print(f"[opt_step {opt_step}] loss={opt_loss:.4f}")
+                else:
+                    print(
+                        f"[opt_step {opt_step}] loss={opt_loss:.4f} "
+                        f"cuda_alloc_max_mb={alloc_mb_max:.1f} "
+                        f"cuda_reserved_max_mb={reserved_mb_max:.1f} "
+                        f"cuda_peak_alloc_max_mb={peak_alloc_mb_max:.1f} "
+                        f"cuda_peak_reserved_max_mb={peak_reserved_mb_max:.1f}"
+                    )
                 if wandb_run is not None:
-                    wandb_run.log({"train/loss": opt_loss, "train/opt_step": opt_step}, step=opt_step)
+                    payload = {"train/loss": opt_loss, "train/opt_step": opt_step}
+                    if alloc_mb_max is not None:
+                        payload.update(
+                            {
+                                "system/cuda_alloc_max_mb": alloc_mb_max,
+                                "system/cuda_reserved_max_mb": reserved_mb_max,
+                                "system/cuda_peak_alloc_max_mb": peak_alloc_mb_max,
+                                "system/cuda_peak_reserved_max_mb": peak_reserved_mb_max,
+                            }
+                        )
+                    wandb_run.log(payload, step=opt_step)
             opt_loss_sum = 0.0
             opt_micro_count = 0
 
