@@ -72,17 +72,34 @@ def _load_qwen3(args, device: torch.device):
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
     )
-    model = AutoModelForCausalLM.from_config(
-        model_config,
-        trust_remote_code=args.trust_remote_code,
-    )
+    attn_impl = "default"
+    flash_fallback_reason = None
+    if device.type == "cuda":
+        try:
+            model = AutoModelForCausalLM.from_config(
+                model_config,
+                trust_remote_code=args.trust_remote_code,
+                attn_implementation="flash_attention_2",
+            )
+            attn_impl = "flash_attention_2"
+        except Exception as exc:
+            flash_fallback_reason = str(exc).strip().splitlines()[0]
+            model = AutoModelForCausalLM.from_config(
+                model_config,
+                trust_remote_code=args.trust_remote_code,
+            )
+    else:
+        model = AutoModelForCausalLM.from_config(
+            model_config,
+            trust_remote_code=args.trust_remote_code,
+        )
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
     model.to(device=device, dtype=model_dtype)
     model.train()
-    return model, tokenizer, model_dtype
+    return model, tokenizer, model_dtype, attn_impl, flash_fallback_reason
 
 
 def _normalize_role(raw_role: str):
@@ -474,7 +491,7 @@ def main():
         ds_cfg.setdefault("zero_optimization", {})
         ds_cfg["zero_optimization"]["stage"] = int(args.zero_stage)
 
-    model, tokenizer, model_dtype = _load_qwen3(args, device)
+    model, tokenizer, model_dtype, attn_impl, flash_fallback_reason = _load_qwen3(args, device)
     samples, skipped_samples, sft_stats = _load_sft_samples(
         args.dataset_path,
         tokenizer,
@@ -485,7 +502,12 @@ def main():
     if rank == 0:
         ds_file = str(Path(getattr(ds, "__file__", "unknown")).resolve())
         print(f"[deepspeed] impl=official module={ds_file}")
-        print(f"[model] initialized {args.model_name} from config on {device} (param_dtype={model_dtype})")
+        print(
+            f"[model] initialized {args.model_name} from config on {device} "
+            f"(param_dtype={model_dtype}, attention={attn_impl})"
+        )
+        if flash_fallback_reason is not None:
+            print(f"[model] flash_attention_2 unavailable, fallback to default attention: {flash_fallback_reason}")
         print(f"[data] path={args.dataset_path} samples={len(samples)} skipped={skipped_samples}")
         print(
             "[data] sft_stats "
