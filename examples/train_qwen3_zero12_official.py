@@ -100,19 +100,50 @@ def _load_qwen3(args, device: torch.device):
         "local_files_only": args.local_files_only,
         "torch_dtype": torch.float32,
     }
-    if device.type == "cuda":
+    requested_attn = str(getattr(args, "attn_impl", "eager")).strip().lower()
+
+    def _load_model(attn_name=None):
+        kwargs = dict(model_load_kwargs)
+        if attn_name is not None:
+            kwargs["attn_implementation"] = attn_name
+        return AutoModelForCausalLM.from_pretrained(args.model_name, **kwargs)
+
+    if requested_attn == "eager":
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name,
-                attn_implementation="flash_attention_2",
-                **model_load_kwargs,
-            )
-            attn_impl = "flash_attention_2"
+            model = _load_model("eager")
+            attn_impl = "eager"
         except Exception as exc:
             flash_fallback_reason = str(exc).strip().splitlines()[0]
-            model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_load_kwargs)
+            model = _load_model(None)
+            attn_impl = "default"
+    elif requested_attn == "flash_attention_2":
+        if device.type != "cuda":
+            raise RuntimeError("--attn-impl=flash_attention_2 requires CUDA.")
+        try:
+            model = _load_model("flash_attention_2")
+            attn_impl = "flash_attention_2"
+        except Exception as exc:
+            reason = str(exc).strip().splitlines()[0]
+            raise RuntimeError(
+                "Requested --attn-impl=flash_attention_2 but initialization failed. "
+                f"Reason: {reason}"
+            ) from exc
+    else:  # auto
+        if device.type == "cuda":
+            try:
+                model = _load_model("flash_attention_2")
+                attn_impl = "flash_attention_2"
+            except Exception as exc:
+                flash_fallback_reason = str(exc).strip().splitlines()[0]
+                try:
+                    model = _load_model("eager")
+                    attn_impl = "eager"
+                except Exception:
+                    model = _load_model(None)
+                    attn_impl = "default"
+        else:
+            model = _load_model(None)
+            attn_impl = "default"
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
@@ -475,6 +506,12 @@ def main():
         default="bfloat16",
         choices=["auto", "float32", "float16", "bfloat16"],
     )
+    parser.add_argument(
+        "--attn-impl",
+        type=str,
+        default="eager",
+        choices=["eager", "auto", "flash_attention_2"],
+    )
     parser.add_argument("--dataset-path", type=str, default="data/lima.json")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -529,6 +566,8 @@ def main():
             f"[model] loaded pretrained {args.model_name} on {device} "
             f"(param_dtype={param_dtype}, compute_dtype={model_dtype}, ds_precision={ds_precision_mode}, attention={attn_impl})"
         )
+        if attn_impl == "flash_attention_2":
+            print("[model] flash_attention_2 pad-mask fix enabled (avoid fully-masked query rows).")
         if flash_fallback_reason is not None:
             print(f"[model] flash_attention_2 unavailable, fallback to default attention: {flash_fallback_reason}")
         print(f"[data] path={args.dataset_path} samples={len(samples)} skipped={skipped_samples}")
@@ -580,9 +619,18 @@ def main():
             device=device,
         )
 
+        # FlashAttention kernels can produce non-finite values for fully-masked query rows
+        # (typically padded positions at the tail). All-one mask keeps real-token behavior
+        # unchanged under causal masking and stabilizes ignored pad queries.
+        attention_mask_for_model = (
+            torch.ones_like(attention_mask, dtype=torch.long)
+            if attn_impl == "flash_attention_2"
+            else attention_mask
+        )
+
         outputs = engine(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            attention_mask=attention_mask_for_model,
             labels=labels,
         )
         loss = _extract_loss(outputs)
@@ -593,7 +641,8 @@ def main():
                 "Non-finite loss detected before backward. "
                 f"step={step + 1} valid_label_tokens={valid_label_tokens} max_input_id={max_input_id} "
                 f"attention={attn_impl} compute_dtype={model_dtype} ds_precision={ds_precision_mode} "
-                "flash_runtime_fallback_used=False"
+                "flash_runtime_fallback_used=False. "
+                "Try rerun with --attn-impl eager."
             )
         reduced_loss = _mean_tensor_across_ranks(loss, device=device)
         last_loss = reduced_loss
