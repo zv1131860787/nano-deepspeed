@@ -598,7 +598,8 @@ def main():
             raise RuntimeError(
                 "Non-finite loss detected before backward. "
                 f"step={step + 1} valid_label_tokens={valid_label_tokens} max_input_id={max_input_id} "
-                f"attention={attn_impl} compute_dtype={model_dtype} ds_precision={ds_precision_mode}"
+                f"attention={attn_impl} compute_dtype={model_dtype} ds_precision={ds_precision_mode} "
+                "flash_runtime_fallback_used=False"
             )
         reduced_loss = _mean_tensor_across_ranks(loss, device=device)
         last_loss = reduced_loss

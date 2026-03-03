@@ -51,6 +51,24 @@ def _resolve_model_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
     return torch.bfloat16 if _cuda_bf16_supported() else torch.float16
 
 
+def _configure_deepspeed_precision(ds_cfg, *, model_dtype: torch.dtype, device: torch.device) -> str:
+    ds_cfg.pop("fp16", None)
+    ds_cfg.pop("bf16", None)
+
+    if device.type != "cuda":
+        return "fp32"
+
+    if model_dtype == torch.bfloat16:
+        ds_cfg["bf16"] = {"enabled": True}
+        return "bf16"
+
+    if model_dtype == torch.float16:
+        ds_cfg["fp16"] = {"enabled": True, "loss_scale": 0}
+        return "fp16"
+
+    return "fp32"
+
+
 def _load_qwen3(args, device: torch.device):
     try:
         from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
@@ -105,7 +123,8 @@ def _load_qwen3(args, device: torch.device):
         model.gradient_checkpointing_enable()
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
-    model.to(device=device, dtype=model_dtype)
+    # Keep parameters in fp32 for stability; let DeepSpeed mixed-precision control compute dtype.
+    model.to(device=device)
     model.train()
     return model, tokenizer, model_dtype, attn_impl, flash_fallback_reason
 
@@ -523,6 +542,8 @@ def main():
         ds_cfg["zero_optimization"]["stage"] = int(args.zero_stage)
 
     model, tokenizer, model_dtype, attn_impl, flash_fallback_reason = _load_qwen3(args, device)
+    ds_precision_mode = _configure_deepspeed_precision(ds_cfg, model_dtype=model_dtype, device=device)
+    param_dtype = next(model.parameters()).dtype
     samples, skipped_samples, sft_stats = _load_sft_samples(
         args.dataset_path,
         tokenizer,
@@ -535,7 +556,7 @@ def main():
         print(f"[deepspeed] impl=nano module={ds_file}")
         print(
             f"[model] initialized {args.model_name} from config on {device} "
-            f"(param_dtype={model_dtype}, attention={attn_impl})"
+            f"(param_dtype={param_dtype}, compute_dtype={model_dtype}, ds_precision={ds_precision_mode}, attention={attn_impl})"
         )
         if flash_fallback_reason is not None:
             print(f"[model] flash_attention_2 unavailable, fallback to default attention: {flash_fallback_reason}")
@@ -551,6 +572,8 @@ def main():
             f"prompt_alignment_common_prefix={sft_stats['prompt_alignment_common_prefix']}"
         )
 
+    # Keep behavior aligned with official script: pass config via `config=ds_cfg` only.
+    args.deepspeed_config = None
     engine, _, _, _ = ds.initialize(
         args=args,
         model=model,
@@ -592,6 +615,15 @@ def main():
             labels=labels,
         )
         loss = _extract_loss(outputs)
+        if not bool(torch.isfinite(loss.detach()).all()):
+            valid_label_tokens = int((labels != -100).sum().item())
+            max_input_id = int(input_ids.max().item()) if input_ids.numel() > 0 else -1
+            raise RuntimeError(
+                "Non-finite loss detected before backward. "
+                f"step={step + 1} valid_label_tokens={valid_label_tokens} max_input_id={max_input_id} "
+                f"attention={attn_impl} compute_dtype={model_dtype} ds_precision={ds_precision_mode} "
+                "flash_runtime_fallback_used=False"
+            )
         reduced_loss = _mean_tensor_across_ranks(loss, device=device)
         last_loss = reduced_loss
         opt_loss_sum += reduced_loss
