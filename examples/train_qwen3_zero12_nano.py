@@ -21,12 +21,26 @@ def _dist_required() -> bool:
 
 
 def _resolve_model_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
+    def _cuda_bf16_supported() -> bool:
+        if device.type != "cuda":
+            return False
+        if hasattr(torch.cuda, "is_bf16_supported"):
+            try:
+                return bool(torch.cuda.is_bf16_supported())
+            except Exception:
+                return False
+        return False
+
     name = str(dtype_name).strip().lower()
     if name == "float32":
         return torch.float32
     if name == "float16":
         return torch.float16
     if name == "bfloat16":
+        if device.type == "cuda" and not _cuda_bf16_supported():
+            raise RuntimeError(
+                "Requested --model-dtype=bfloat16 but current CUDA device does not support bf16."
+            )
         return torch.bfloat16
     if name != "auto":
         raise ValueError(f"Unsupported --model-dtype={dtype_name!r}")
@@ -34,13 +48,7 @@ def _resolve_model_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
     if device.type != "cuda":
         return torch.float32
 
-    bf16_supported = False
-    if hasattr(torch.cuda, "is_bf16_supported"):
-        try:
-            bf16_supported = bool(torch.cuda.is_bf16_supported())
-        except Exception:
-            bf16_supported = False
-    return torch.bfloat16 if bf16_supported else torch.float16
+    return torch.bfloat16 if _cuda_bf16_supported() else torch.float16
 
 
 def _load_qwen3(args, device: torch.device):
@@ -474,7 +482,7 @@ def main():
     parser.add_argument(
         "--model-dtype",
         type=str,
-        default="auto",
+        default="bfloat16",
         choices=["auto", "float32", "float16", "bfloat16"],
     )
     parser.add_argument("--dataset-path", type=str, default="data/lima.json")
