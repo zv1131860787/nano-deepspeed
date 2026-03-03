@@ -109,6 +109,35 @@ def _render_chat_fallback(messages, *, add_generation_prompt: bool) -> str:
     return "\n".join(lines)
 
 
+def _normalize_token_ids(token_ids):
+    if isinstance(token_ids, dict):
+        if "input_ids" not in token_ids:
+            raise TypeError("chat template output dict has no 'input_ids'")
+        token_ids = token_ids["input_ids"]
+
+    if isinstance(token_ids, torch.Tensor):
+        token_ids = token_ids.tolist()
+    elif hasattr(token_ids, "tolist") and not isinstance(token_ids, list):
+        try:
+            token_ids = token_ids.tolist()
+        except Exception:
+            pass
+
+    if isinstance(token_ids, tuple):
+        token_ids = list(token_ids)
+
+    if isinstance(token_ids, list) and token_ids and isinstance(token_ids[0], (list, tuple)):
+        token_ids = list(token_ids[0])
+
+    if not isinstance(token_ids, list):
+        raise TypeError(f"Unsupported token ids type: {type(token_ids)!r}")
+
+    try:
+        return [int(x) for x in token_ids]
+    except Exception as exc:
+        raise TypeError(f"Token ids are not integer-like: {type(token_ids)!r}") from exc
+
+
 def _tokenize_chat(tokenizer, messages, *, seq_len: int, add_generation_prompt: bool):
     if hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -119,11 +148,7 @@ def _tokenize_chat(tokenizer, messages, *, seq_len: int, add_generation_prompt: 
                 truncation=True,
                 max_length=seq_len,
             )
-            if isinstance(token_ids, torch.Tensor):
-                token_ids = token_ids.tolist()
-            if isinstance(token_ids, list) and token_ids and isinstance(token_ids[0], list):
-                token_ids = token_ids[0]
-            return list(token_ids)
+            return _normalize_token_ids(token_ids)
         except TypeError:
             chat_text = tokenizer.apply_chat_template(
                 messages,
@@ -136,7 +161,7 @@ def _tokenize_chat(tokenizer, messages, *, seq_len: int, add_generation_prompt: 
                 max_length=seq_len,
                 add_special_tokens=False,
             )
-            return list(encoded["input_ids"])
+            return _normalize_token_ids(encoded["input_ids"])
 
     chat_text = _render_chat_fallback(messages, add_generation_prompt=add_generation_prompt)
     encoded = tokenizer(
@@ -145,7 +170,7 @@ def _tokenize_chat(tokenizer, messages, *, seq_len: int, add_generation_prompt: 
         max_length=seq_len,
         add_special_tokens=True,
     )
-    return list(encoded["input_ids"])
+    return _normalize_token_ids(encoded["input_ids"])
 
 
 def _infer_prompt_len(full_ids, prompt_ids):
