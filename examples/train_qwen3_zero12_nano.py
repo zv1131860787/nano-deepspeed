@@ -417,7 +417,7 @@ def _load_model_and_tokenizer(args, device: torch.device):
     model_kwargs = {
         "trust_remote_code": args.trust_remote_code,
         "local_files_only": args.local_files_only,
-        "torch_dtype": torch.float32,
+        "torch_dtype": model_dtype,
     }
 
     attn_impl = args.attn_impl
@@ -504,6 +504,7 @@ def main():
         ds_cfg["zero_optimization"]["stage"] = int(args.zero_stage)
 
     model, tokenizer, model_dtype, attn_impl = _load_model_and_tokenizer(args, device)
+    param_dtype = next(model.parameters()).dtype
     ds_precision = _configure_deepspeed_precision(ds_cfg, model_dtype, device)
 
     samples, skipped_samples, stats = _load_sft_samples(
@@ -517,12 +518,21 @@ def main():
     if rank == 0:
         print(f"[script] path={Path(__file__).resolve()}")
         print(f"[deepspeed] impl=nano module={Path(getattr(ds, '__file__', 'unknown')).resolve()}")
+        zero_cfg = ds_cfg.get("zero_optimization", {}) or {}
+        print(
+            f"[zero] stage={zero_cfg.get('stage', 'n/a')} "
+            f"reduce_scatter={zero_cfg.get('reduce_scatter', 'n/a')} "
+            f"reduce_bucket_size={zero_cfg.get('reduce_bucket_size', 'n/a')} "
+            f"allgather_bucket_size={zero_cfg.get('allgather_bucket_size', 'n/a')} "
+            f"communication_data_type={zero_cfg.get('communication_data_type', 'auto')}"
+        )
         if device.type == "cuda":
             props = torch.cuda.get_device_properties(device)
             total_gb = props.total_memory / (1024.0 * 1024.0 * 1024.0)
             print(f"[cuda] device={props.name} total_mem_gb={total_gb:.2f}")
         print(
-            f"[model] {args.model_name} compute_dtype={model_dtype} ds_precision={ds_precision} attention={attn_impl}"
+            f"[model] {args.model_name} param_dtype={param_dtype} "
+            f"compute_dtype={model_dtype} ds_precision={ds_precision} attention={attn_impl}"
         )
         print(f"[data] path={args.dataset_path} samples={len(samples)} skipped={skipped_samples}")
         print(
