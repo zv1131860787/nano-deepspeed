@@ -9,6 +9,31 @@ import torch
 import torch.distributed as dist
 
 
+def _load_nano_deepspeed():
+    alias = "nano_deepspeed"
+    if alias in sys.modules:
+        return sys.modules[alias]
+
+    repo_root = Path(__file__).resolve().parents[1]
+    pkg_dir = repo_root / "nano_deepspeed"
+    init_py = pkg_dir / "__init__.py"
+    if not init_py.exists():
+        raise RuntimeError(f"Failed to load local package from {init_py}")
+
+    spec = importlib.util.spec_from_file_location(
+        alias,
+        str(init_py),
+        submodule_search_locations=[str(pkg_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot create import spec for {init_py}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _dist_required() -> bool:
     if "RANK" in os.environ:
         return True
@@ -21,37 +46,23 @@ def _dist_required() -> bool:
 
 
 def _resolve_model_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
-    def _cuda_bf16_supported() -> bool:
-        if device.type != "cuda":
-            return False
-        if hasattr(torch.cuda, "is_bf16_supported"):
-            try:
-                return bool(torch.cuda.is_bf16_supported())
-            except Exception:
-                return False
-        return False
-
     name = str(dtype_name).strip().lower()
     if name == "float32":
         return torch.float32
     if name == "float16":
+        if device.type != "cuda":
+            raise RuntimeError("float16 requires CUDA.")
         return torch.float16
     if name == "bfloat16":
-        if device.type == "cuda" and not _cuda_bf16_supported():
-            raise RuntimeError(
-                "Requested --model-dtype=bfloat16 but current CUDA device does not support bf16."
-            )
+        if device.type != "cuda":
+            raise RuntimeError("bfloat16 requires CUDA.")
+        if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("Requested bfloat16 but CUDA device does not support bf16.")
         return torch.bfloat16
-    if name != "auto":
-        raise ValueError(f"Unsupported --model-dtype={dtype_name!r}")
-
-    if device.type != "cuda":
-        return torch.float32
-
-    return torch.bfloat16 if _cuda_bf16_supported() else torch.float16
+    raise ValueError(f"Unsupported --model-dtype={dtype_name!r}")
 
 
-def _configure_deepspeed_precision(ds_cfg, *, model_dtype: torch.dtype, device: torch.device) -> str:
+def _configure_deepspeed_precision(ds_cfg: dict, model_dtype: torch.dtype, device: torch.device) -> str:
     ds_cfg.pop("fp16", None)
     ds_cfg.pop("bf16", None)
 
@@ -69,105 +80,6 @@ def _configure_deepspeed_precision(ds_cfg, *, model_dtype: torch.dtype, device: 
     return "fp32"
 
 
-def _load_qwen3(args, device: torch.device):
-    try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as exc:
-        raise RuntimeError(
-            "This example requires `transformers`. Install it first, e.g. `pip install transformers`."
-        ) from exc
-
-    model_dtype = _resolve_model_dtype(args.model_dtype, device)
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
-        trust_remote_code=args.trust_remote_code,
-        local_files_only=args.local_files_only,
-    )
-    if hasattr(tokenizer, "truncation_side"):
-        tokenizer.truncation_side = "right"
-    if tokenizer.pad_token_id is None:
-        if tokenizer.eos_token is None:
-            raise ValueError(
-                "Tokenizer has no pad_token/eos_token; please provide a compatible tokenizer or set one manually."
-            )
-        tokenizer.pad_token = tokenizer.eos_token
-
-    attn_impl = "default"
-    flash_fallback_reason = None
-    model_load_kwargs = {
-        "trust_remote_code": args.trust_remote_code,
-        "local_files_only": args.local_files_only,
-        "torch_dtype": torch.float32,
-    }
-    requested_attn = str(getattr(args, "attn_impl", "auto")).strip().lower()
-
-    def _load_model(attn_name=None):
-        kwargs = dict(model_load_kwargs)
-        if attn_name is not None:
-            kwargs["attn_implementation"] = attn_name
-        return AutoModelForCausalLM.from_pretrained(args.model_name, **kwargs)
-
-    if requested_attn == "eager":
-        try:
-            model = _load_model("eager")
-            attn_impl = "eager"
-        except Exception as exc:
-            flash_fallback_reason = str(exc).strip().splitlines()[0]
-            model = _load_model(None)
-            attn_impl = "default"
-    elif requested_attn == "sdpa":
-        try:
-            model = _load_model("sdpa")
-            attn_impl = "sdpa"
-        except Exception as exc:
-            reason = str(exc).strip().splitlines()[0]
-            raise RuntimeError(
-                "Requested --attn-impl=sdpa but initialization failed. "
-                f"Reason: {reason}"
-            ) from exc
-    elif requested_attn == "flash_attention_2":
-        if device.type != "cuda":
-            raise RuntimeError("--attn-impl=flash_attention_2 requires CUDA.")
-        try:
-            model = _load_model("flash_attention_2")
-            attn_impl = "flash_attention_2"
-        except Exception as exc:
-            reason = str(exc).strip().splitlines()[0]
-            raise RuntimeError(
-                "Requested --attn-impl=flash_attention_2 but initialization failed. "
-                f"Reason: {reason}"
-            ) from exc
-    else:  # auto
-        if device.type == "cuda":
-            try:
-                model = _load_model("flash_attention_2")
-                attn_impl = "flash_attention_2"
-            except Exception as exc:
-                flash_fallback_reason = str(exc).strip().splitlines()[0]
-                try:
-                    model = _load_model("sdpa")
-                    attn_impl = "sdpa"
-                except Exception:
-                    try:
-                        model = _load_model("eager")
-                        attn_impl = "eager"
-                    except Exception:
-                        model = _load_model(None)
-                        attn_impl = "default"
-        else:
-            model = _load_model(None)
-            attn_impl = "default"
-    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-    # Keep parameters in fp32 for stability; let DeepSpeed mixed-precision control compute dtype.
-    model.to(device=device)
-    model.train()
-    return model, tokenizer, model_dtype, attn_impl, flash_fallback_reason
-
-
 def _normalize_role(raw_role: str):
     role = str(raw_role).strip().lower()
     if role in {"human", "user"}:
@@ -179,7 +91,7 @@ def _normalize_role(raw_role: str):
     return None
 
 
-def _render_chat_fallback(messages, *, add_generation_prompt: bool) -> str:
+def _render_chat_fallback(messages, add_generation_prompt: bool) -> str:
     lines = []
     for msg in messages:
         role = msg["role"]
@@ -197,17 +109,10 @@ def _render_chat_fallback(messages, *, add_generation_prompt: bool) -> str:
 
 def _normalize_token_ids(token_ids):
     if isinstance(token_ids, dict):
-        if "input_ids" not in token_ids:
-            raise TypeError("chat template output dict has no 'input_ids'")
-        token_ids = token_ids["input_ids"]
+        token_ids = token_ids.get("input_ids")
 
     if isinstance(token_ids, torch.Tensor):
         token_ids = token_ids.tolist()
-    elif hasattr(token_ids, "tolist") and not isinstance(token_ids, list):
-        try:
-            token_ids = token_ids.tolist()
-        except Exception:
-            pass
 
     if isinstance(token_ids, tuple):
         token_ids = list(token_ids)
@@ -218,13 +123,10 @@ def _normalize_token_ids(token_ids):
     if not isinstance(token_ids, list):
         raise TypeError(f"Unsupported token ids type: {type(token_ids)!r}")
 
-    try:
-        return [int(x) for x in token_ids]
-    except Exception as exc:
-        raise TypeError(f"Token ids are not integer-like: {type(token_ids)!r}") from exc
+    return [int(x) for x in token_ids]
 
 
-def _tokenize_chat(tokenizer, messages, *, seq_len: int, add_generation_prompt: bool):
+def _tokenize_chat(tokenizer, messages, seq_len: int, add_generation_prompt: bool):
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             token_ids = tokenizer.apply_chat_template(
@@ -236,51 +138,33 @@ def _tokenize_chat(tokenizer, messages, *, seq_len: int, add_generation_prompt: 
             )
             return _normalize_token_ids(token_ids)
         except TypeError:
-            chat_text = tokenizer.apply_chat_template(
+            text = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
             )
-            encoded = tokenizer(
-                chat_text,
-                truncation=True,
-                max_length=seq_len,
-                add_special_tokens=False,
-            )
+            encoded = tokenizer(text, truncation=True, max_length=seq_len, add_special_tokens=False)
             return _normalize_token_ids(encoded["input_ids"])
 
-    chat_text = _render_chat_fallback(messages, add_generation_prompt=add_generation_prompt)
-    encoded = tokenizer(
-        chat_text,
-        truncation=True,
-        max_length=seq_len,
-        add_special_tokens=True,
-    )
+    text = _render_chat_fallback(messages, add_generation_prompt=add_generation_prompt)
+    encoded = tokenizer(text, truncation=True, max_length=seq_len, add_special_tokens=True)
     return _normalize_token_ids(encoded["input_ids"])
 
 
-def _infer_prompt_len(full_ids, prompt_ids):
+def _infer_prompt_len(full_ids, prompt_ids) -> int:
     if not full_ids or not prompt_ids:
-        return 0, "empty"
+        return 0
     if len(full_ids) >= len(prompt_ids) and full_ids[: len(prompt_ids)] == prompt_ids:
-        return len(prompt_ids), "prefix"
+        return len(prompt_ids)
 
-    # Fallback when tokenizer truncation/template behavior breaks strict prefix matching.
     common = 0
     upper = min(len(full_ids), len(prompt_ids))
     while common < upper and full_ids[common] == prompt_ids[common]:
         common += 1
-    return common, "common_prefix"
+    return common
 
 
-def _load_sft_samples(
-    dataset_path: str,
-    tokenizer,
-    *,
-    seq_len: int,
-    max_samples: int = 0,
-    return_stats: bool = False,
-):
+def _load_sft_samples(dataset_path: str, tokenizer, seq_len: int, max_samples: int = 0):
     with open(dataset_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
@@ -291,20 +175,16 @@ def _load_sft_samples(
     skipped = 0
     stats = {
         "items_total": len(raw_data),
-        "items_kept": 0,
-        "messages_kept": 0,
         "assistant_turns": 0,
-        "prompt_alignment_common_prefix": 0,
-        "skipped_empty_full_ids": 0,
         "skipped_all_masked": 0,
     }
+
     for item in raw_data:
         if not isinstance(item, dict):
             continue
         turns = item.get("conversations")
         if not isinstance(turns, list):
             continue
-        stats["items_kept"] += 1
 
         messages = []
         for turn in turns:
@@ -318,111 +198,73 @@ def _load_sft_samples(
             if not content:
                 continue
             messages.append({"role": role, "content": content})
-        stats["messages_kept"] += len(messages)
 
         for idx, msg in enumerate(messages):
             if msg["role"] != "assistant" or idx == 0:
                 continue
+
             stats["assistant_turns"] += 1
 
             prompt_messages = messages[:idx]
             full_messages = messages[: idx + 1]
 
-            full_ids = _tokenize_chat(
-                tokenizer,
-                full_messages,
-                seq_len=seq_len,
-                add_generation_prompt=False,
-            )
-            prompt_ids = _tokenize_chat(
-                tokenizer,
-                prompt_messages,
-                seq_len=seq_len,
-                add_generation_prompt=True,
-            )
+            full_ids = _tokenize_chat(tokenizer, full_messages, seq_len=seq_len, add_generation_prompt=False)
+            prompt_ids = _tokenize_chat(tokenizer, prompt_messages, seq_len=seq_len, add_generation_prompt=True)
 
             if not full_ids:
                 skipped += 1
-                stats["skipped_empty_full_ids"] += 1
                 continue
 
-            prompt_len, align_mode = _infer_prompt_len(full_ids, prompt_ids)
-            if align_mode == "common_prefix":
-                stats["prompt_alignment_common_prefix"] += 1
+            prompt_len = _infer_prompt_len(full_ids, prompt_ids)
             labels = list(full_ids)
-            for pos in range(prompt_len):
-                labels[pos] = -100
+            for i in range(prompt_len):
+                labels[i] = -100
 
-            if not any(token != -100 for token in labels):
+            if not any(x != -100 for x in labels):
                 skipped += 1
                 stats["skipped_all_masked"] += 1
                 continue
 
             samples.append({"input_ids": full_ids, "labels": labels})
             if max_samples > 0 and len(samples) >= max_samples:
-                if return_stats:
-                    return samples, skipped, stats
-                return samples, skipped
+                break
+
+        if max_samples > 0 and len(samples) >= max_samples:
+            break
 
     if not samples:
-        detail = (
-            f"items_total={stats['items_total']} "
-            f"items_kept={stats['items_kept']} "
-            f"messages_kept={stats['messages_kept']} "
-            f"assistant_turns={stats['assistant_turns']} "
-            f"skipped_empty_full_ids={stats['skipped_empty_full_ids']} "
-            f"skipped_all_masked={stats['skipped_all_masked']} "
-            f"prompt_alignment_common_prefix={stats['prompt_alignment_common_prefix']}"
-        )
         raise RuntimeError(
-            f"No valid SFT samples were built from {dataset_path}. "
-            "Check dataset schema or increase --seq-len. "
-            f"SFT stats: {detail}"
+            f"No valid SFT samples built from {dataset_path}. "
+            f"assistant_turns={stats['assistant_turns']} skipped_all_masked={stats['skipped_all_masked']}"
         )
-    if return_stats:
-        return samples, skipped, stats
-    return samples, skipped
+
+    return samples, skipped, stats
 
 
-def _build_sft_batch(
-    samples,
-    *,
-    batch_size: int,
-    step: int,
-    rank: int,
-    world_size: int,
-    pad_token_id: int,
-    device: torch.device,
-):
+def _build_sft_batch(samples, batch_size: int, step: int, rank: int, world_size: int, pad_token_id: int, device):
     if batch_size <= 0:
         raise ValueError("--batch-size must be > 0")
-    if not samples:
-        raise ValueError("SFT samples are empty.")
 
     start = step * batch_size * world_size + rank * batch_size
     total = len(samples)
-    batch_samples = []
+
+    batch = []
     for offset in range(batch_size):
-        sample_idx = (start + offset) % total
-        batch_samples.append(samples[sample_idx])
+        idx = (start + offset) % total
+        batch.append(samples[idx])
 
-    max_len = max(len(sample["input_ids"]) for sample in batch_samples)
-    input_ids = torch.full(
-        (batch_size, max_len),
-        int(pad_token_id),
-        dtype=torch.long,
-        device=device,
-    )
-    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+    max_len = max(len(x["input_ids"]) for x in batch)
+    input_ids = torch.full((batch_size, max_len), int(pad_token_id), dtype=torch.long, device=device)
     labels = torch.full((batch_size, max_len), -100, dtype=torch.long, device=device)
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
 
-    for row, sample in enumerate(batch_samples):
+    for row, sample in enumerate(batch):
         ids = torch.tensor(sample["input_ids"], dtype=torch.long, device=device)
         lbs = torch.tensor(sample["labels"], dtype=torch.long, device=device)
-        sample_len = int(ids.shape[0])
-        input_ids[row, :sample_len] = ids
-        attention_mask[row, :sample_len] = 1
-        labels[row, :sample_len] = lbs
+        n = int(ids.shape[0])
+        input_ids[row, :n] = ids
+        labels[row, :n] = lbs
+        attention_mask[row, :n] = 1
 
     return input_ids, attention_mask, labels
 
@@ -432,49 +274,9 @@ def _extract_loss(outputs) -> torch.Tensor:
         return outputs.loss
     if isinstance(outputs, dict) and "loss" in outputs:
         return outputs["loss"]
-    if isinstance(outputs, tuple) and len(outputs) > 0 and isinstance(outputs[0], torch.Tensor):
+    if isinstance(outputs, tuple) and outputs and isinstance(outputs[0], torch.Tensor):
         return outputs[0]
-    raise RuntimeError("Model outputs do not contain a loss tensor. Ensure labels are passed to the model.")
-
-
-def _load_nano_deepspeed():
-    repo_root = Path(__file__).resolve().parents[1]
-    alias = "nano_deepspeed"
-    if alias in sys.modules:
-        return sys.modules[alias]
-
-    pkg_dir = repo_root / "nano_deepspeed"
-    init_py = pkg_dir / "__init__.py"
-    spec = importlib.util.spec_from_file_location(
-        alias,
-        init_py,
-        submodule_search_locations=[str(pkg_dir)],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load local package from {init_py}")
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[alias] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _max_across_ranks(value: float, device: torch.device) -> float:
-    if not dist.is_initialized():
-        return float(value)
-    t = torch.tensor(float(value), device=device, dtype=torch.float64)
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return float(t.item())
-
-
-def _mean_tensor_across_ranks(value: torch.Tensor, device: torch.device) -> float:
-    t = value.detach()
-    if t.ndim != 0:
-        t = t.mean()
-    t = t.to(device=device, dtype=torch.float64)
-    if dist.is_initialized():
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t /= dist.get_world_size()
-    return float(t.item())
+    raise RuntimeError("Model outputs do not contain a loss tensor.")
 
 
 def _any_true_across_ranks(flag: bool, device: torch.device) -> bool:
@@ -485,65 +287,52 @@ def _any_true_across_ranks(flag: bool, device: torch.device) -> bool:
     return bool(t.item() > 0)
 
 
-def _all_true_across_ranks(flag: bool, device: torch.device) -> bool:
-    if not dist.is_initialized():
-        return bool(flag)
-    t = torch.tensor(1 if flag else 0, device=device, dtype=torch.int32)
-    dist.all_reduce(t, op=dist.ReduceOp.MIN)
-    return bool(t.item() > 0)
+def _mean_tensor_across_ranks(value: torch.Tensor, device: torch.device) -> float:
+    t = value.detach()
+    if t.ndim != 0:
+        t = t.mean()
+    t = t.to(device=device, dtype=torch.float32)
+    if dist.is_initialized():
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        t /= dist.get_world_size()
+    return float(t.item())
 
 
-def _set_attention_implementation(module, attn_impl: str) -> bool:
-    if hasattr(module, "set_attn_implementation"):
-        try:
-            module.set_attn_implementation(attn_impl)
-            return True
-        except Exception:
-            return False
-    return False
-
-
-def _nonfinite_param_summary(module, *, max_names: int = 3):
-    bad_param_tensors = 0
-    bad_param_elements = 0
-    bad_names = []
-    for name, p in module.named_parameters():
-        if p is None:
-            continue
-        data = p.detach()
-        finite = torch.isfinite(data)
-        if bool(finite.all()):
-            continue
-        bad_param_tensors += 1
-        bad_param_elements += int((~finite).sum().item())
-        if len(bad_names) < max_names:
-            bad_names.append(name)
-    return bad_param_tensors, bad_param_elements, bad_names
-
-
-def _engine_zero_grad_compat(engine):
+def _engine_zero_grad(engine):
     try:
         engine.zero_grad(set_to_none=True)
     except TypeError:
         engine.zero_grad()
 
 
-def _engine_force_step_compat(engine) -> bool:
-    try:
-        engine.step(force=True)
-        return True
-    except TypeError:
-        return False
+def _has_nonfinite_grads(module) -> bool:
+    for p in module.parameters():
+        g = getattr(p, "grad", None)
+        if g is None:
+            continue
+        if not bool(torch.isfinite(g).all()):
+            return True
+    return False
 
 
-def _init_wandb_if_available(args, *, rank: int, ds_impl: str, ds_cfg: dict, dataset_size: int):
+def _repair_nonfinite_params(module) -> int:
+    fixed = 0
+    for p in module.parameters():
+        finite = torch.isfinite(p.data)
+        if bool(finite.all()):
+            continue
+        torch.nan_to_num(p.data, nan=0.0, posinf=1e4, neginf=-1e4, out=p.data)
+        fixed += 1
+    return fixed
+
+
+def _init_wandb(args, rank: int, dataset_size: int):
     if rank != 0:
         return None
 
     try:
         import wandb
-    except ImportError:
-        print("[wandb] package not found; skip logging.")
+    except Exception:
         return None
 
     try:
@@ -551,23 +340,66 @@ def _init_wandb_if_available(args, *, rank: int, ds_impl: str, ds_cfg: dict, dat
             project=args.wandb_project,
             name=args.wandb_run_name,
             config={
-                "ds_impl": ds_impl,
                 "model_name": args.model_name,
-                "model_dtype": args.model_dtype,
                 "steps": int(args.steps),
                 "seq_len": int(args.seq_len),
                 "batch_size": int(args.batch_size),
-                "grad_accum": int(ds_cfg.get("gradient_accumulation_steps", 1)),
-                "zero_stage": int((ds_cfg.get("zero_optimization", {}) or {}).get("stage", 0)),
                 "dataset_path": str(args.dataset_path),
                 "dataset_size": int(dataset_size),
+                "attn_impl": args.attn_impl,
             },
         )
         print(f"[wandb] enabled project={args.wandb_project}")
         return run
-    except Exception as exc:
-        print(f"[wandb] init failed, skip logging: {exc}")
+    except Exception:
         return None
+
+
+def _load_model_and_tokenizer(args, device: torch.device):
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("Please install transformers first: pip install transformers") from exc
+
+    model_dtype = _resolve_model_dtype(args.model_dtype, device)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name,
+        trust_remote_code=args.trust_remote_code,
+        local_files_only=args.local_files_only,
+    )
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is None:
+            raise RuntimeError("Tokenizer has no pad_token/eos_token.")
+        tokenizer.pad_token = tokenizer.eos_token
+    if hasattr(tokenizer, "truncation_side"):
+        tokenizer.truncation_side = "right"
+
+    model_kwargs = {
+        "trust_remote_code": args.trust_remote_code,
+        "local_files_only": args.local_files_only,
+        "torch_dtype": torch.float32,
+    }
+
+    attn_impl = args.attn_impl
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            attn_implementation=attn_impl,
+            **model_kwargs,
+        )
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
+        attn_impl = "default"
+
+    if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+
+    model.to(device=device)
+    model.train()
+    return model, tokenizer, model_dtype, attn_impl
 
 
 def main():
@@ -575,54 +407,54 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser = ds.add_config_arguments(parser)
-    parser.add_argument("--steps", type=int, default=10)
-    parser.add_argument("--seq-len", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=1)
+
+    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--zero-stage", type=int, default=None, choices=[0, 1, 2])
+
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-0.6B")
-    parser.add_argument(
-        "--model-dtype",
-        type=str,
-        default="bfloat16",
-        choices=["auto", "float32", "float16", "bfloat16"],
-    )
-    parser.add_argument(
-        "--attn-impl",
-        type=str,
-        default="auto",
-        choices=["eager", "sdpa", "auto", "flash_attention_2"],
-    )
+    parser.add_argument("--model-dtype", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--attn-impl", type=str, default="eager", choices=["eager", "sdpa"])
+
     parser.add_argument("--dataset-path", type=str, default="data/lima.json")
     parser.add_argument("--max-samples", type=int, default=0)
+
+    parser.add_argument("--zero-stage", type=int, default=None, choices=[0, 1, 2])
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+
     parser.add_argument("--wandb-project", type=str, default="nano-deepspeed-sft")
     parser.add_argument("--wandb-run-name", type=str, default=None)
+
     args = parser.parse_args()
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_dir = Path(__file__).resolve().parent
     if args.deepspeed_config is None:
-        args.deepspeed_config = os.path.join(script_dir, "ds_config_zero2.json")
+        args.deepspeed_config = str(script_dir / "ds_config_zero2.json")
     elif not os.path.isabs(args.deepspeed_config) and not os.path.exists(args.deepspeed_config):
-        args.deepspeed_config = os.path.join(script_dir, args.deepspeed_config)
+        args.deepspeed_config = str(script_dir / args.deepspeed_config)
+
     if not os.path.isabs(args.dataset_path) and not os.path.exists(args.dataset_path):
-        args.dataset_path = os.path.join(script_dir, args.dataset_path)
+        args.dataset_path = str(script_dir / args.dataset_path)
 
     dist_required = _dist_required()
     if dist_required:
         ds.init_distributed()
 
-    torch.manual_seed(args.seed)
-
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
+
     device = (
         torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
         if torch.cuda.is_available()
         else torch.device("cpu")
     )
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+
+    torch.manual_seed(args.seed)
 
     with open(args.deepspeed_config, "r", encoding="utf-8") as f:
         ds_cfg = json.load(f)
@@ -630,40 +462,28 @@ def main():
         ds_cfg.setdefault("zero_optimization", {})
         ds_cfg["zero_optimization"]["stage"] = int(args.zero_stage)
 
-    model, tokenizer, model_dtype, attn_impl, flash_fallback_reason = _load_qwen3(args, device)
-    ds_precision_mode = _configure_deepspeed_precision(ds_cfg, model_dtype=model_dtype, device=device)
-    param_dtype = next(model.parameters()).dtype
-    samples, skipped_samples, sft_stats = _load_sft_samples(
+    model, tokenizer, model_dtype, attn_impl = _load_model_and_tokenizer(args, device)
+    ds_precision = _configure_deepspeed_precision(ds_cfg, model_dtype, device)
+
+    samples, skipped_samples, stats = _load_sft_samples(
         args.dataset_path,
         tokenizer,
         seq_len=args.seq_len,
         max_samples=args.max_samples,
-        return_stats=True,
     )
+
     if rank == 0:
-        ds_file = str(Path(getattr(ds, "__file__", "unknown")).resolve())
-        print(f"[deepspeed] impl=nano module={ds_file}")
+        print(f"[script] path={Path(__file__).resolve()}")
+        print(f"[deepspeed] impl=nano module={Path(getattr(ds, '__file__', 'unknown')).resolve()}")
         print(
-            f"[model] loaded pretrained {args.model_name} on {device} "
-            f"(param_dtype={param_dtype}, compute_dtype={model_dtype}, ds_precision={ds_precision_mode}, attention={attn_impl})"
+            f"[model] {args.model_name} compute_dtype={model_dtype} ds_precision={ds_precision} attention={attn_impl}"
         )
-        if attn_impl == "flash_attention_2":
-            print("[model] flash_attention_2 pad-mask fix enabled (avoid fully-masked query rows).")
-        if flash_fallback_reason is not None:
-            print(f"[model] flash_attention_2 unavailable, fallback to default attention: {flash_fallback_reason}")
         print(f"[data] path={args.dataset_path} samples={len(samples)} skipped={skipped_samples}")
         print(
-            "[data] sft_stats "
-            f"items_total={sft_stats['items_total']} "
-            f"items_kept={sft_stats['items_kept']} "
-            f"messages_kept={sft_stats['messages_kept']} "
-            f"assistant_turns={sft_stats['assistant_turns']} "
-            f"skipped_empty_full_ids={sft_stats['skipped_empty_full_ids']} "
-            f"skipped_all_masked={sft_stats['skipped_all_masked']} "
-            f"prompt_alignment_common_prefix={sft_stats['prompt_alignment_common_prefix']}"
+            f"[data] items_total={stats['items_total']} assistant_turns={stats['assistant_turns']} "
+            f"skipped_all_masked={stats['skipped_all_masked']}"
         )
 
-    # Keep behavior aligned with official script: pass config via `config=ds_cfg` only.
     args.deepspeed_config = None
     engine, _, _, _ = ds.initialize(
         args=args,
@@ -674,20 +494,12 @@ def main():
     )
 
     grad_accum = int(ds_cfg.get("gradient_accumulation_steps", 1))
-    _engine_zero_grad_compat(engine)
-    last_loss = None
-    logged_loss = None
+    _engine_zero_grad(engine)
+
+    wandb_run = _init_wandb(args, rank=rank, dataset_size=len(samples))
+
     opt_loss_sum = 0.0
     opt_micro_count = 0
-    wandb_run = _init_wandb_if_available(
-        args,
-        rank=rank,
-        ds_impl="nano",
-        ds_cfg=ds_cfg,
-        dataset_size=len(samples),
-    )
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device=device)
 
     for step in range(args.steps):
         input_ids, attention_mask, labels = _build_sft_batch(
@@ -700,159 +512,44 @@ def main():
             device=device,
         )
 
-        # FlashAttention kernels can produce non-finite values for fully-masked query rows
-        # (typically padded positions at the tail). All-one mask keeps real-token behavior
-        # unchanged under causal masking and stabilizes ignored pad queries.
-        attention_mask_for_model = (
-            torch.ones_like(attention_mask, dtype=torch.long)
-            if attn_impl == "flash_attention_2"
-            else attention_mask
-        )
-        outputs = engine(
-            input_ids=input_ids,
-            attention_mask=attention_mask_for_model,
-            labels=labels,
-        )
+        outputs = engine(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
         loss = _extract_loss(outputs)
 
-        flash_fallback_attempted = False
-        flash_fallback_succeeded = False
-        non_finite = _any_true_across_ranks(not bool(torch.isfinite(loss.detach()).all()), device=device)
-        if non_finite and attn_impl == "flash_attention_2":
-            flash_fallback_attempted = True
-            switched = _set_attention_implementation(engine.module, "sdpa")
-            switched_all = _all_true_across_ranks(switched, device=device)
-            if switched_all:
-                attn_impl = "sdpa"
-                if rank == 0:
-                    print(
-                        f"[warn] non-finite loss detected at step={step + 1} with flash_attention_2; "
-                        "switching to sdpa attention and retrying this step."
-                    )
-                outputs = engine(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
-                loss = _extract_loss(outputs)
-                non_finite = _any_true_across_ranks(not bool(torch.isfinite(loss.detach()).all()), device=device)
-                flash_fallback_succeeded = not non_finite
-                if flash_fallback_succeeded and rank == 0:
-                    print(
-                        f"[diag] step={step + 1} root_cause=flash_attention_2_forward_instability "
-                        "recovered_by=sdpa"
-                    )
+        non_finite_loss = _any_true_across_ranks(not bool(torch.isfinite(loss.detach()).all()), device)
+        if non_finite_loss:
+            fixed = _repair_nonfinite_params(engine.module)
+            _engine_zero_grad(engine)
+            if rank == 0:
+                print(f"[warn] non-finite loss at step={step + 1}; repaired_params={fixed}; step skipped")
+            continue
 
-        if non_finite:
-            valid_label_tokens = int((labels != -100).sum().item())
-            max_input_id = int(input_ids.max().item()) if input_ids.numel() > 0 else -1
-            bad_param_tensors, bad_param_elements, bad_param_names = _nonfinite_param_summary(engine.module)
-            lr = float("nan")
-            try:
-                opt = getattr(engine, "optimizer", None)
-                if opt is not None and getattr(opt, "param_groups", None):
-                    lr = float(opt.param_groups[0].get("lr", float("nan")))
-            except Exception:
-                pass
+        engine.backward(loss)
 
-            root_hints = []
-            if bad_param_tensors > 0:
-                root_hints.append("model_params_non_finite_before_backward")
-            if flash_fallback_attempted and not flash_fallback_succeeded:
-                root_hints.append("flash_to_sdpa_fallback_failed")
-            if attn_impl == "flash_attention_2":
-                root_hints.append("flash_attention_2_forward_non_finite")
-            if not root_hints:
-                root_hints.append("unknown_numerical_instability")
+        non_finite_grad = _any_true_across_ranks(_has_nonfinite_grads(engine.module), device)
+        if non_finite_grad:
+            _engine_zero_grad(engine)
+            if rank == 0:
+                print(f"[warn] non-finite gradients at step={step + 1}; optimizer step skipped")
+            continue
 
-            raise RuntimeError(
-                "Non-finite loss detected before backward. "
-                f"step={step + 1} valid_label_tokens={valid_label_tokens} max_input_id={max_input_id} "
-                f"attention={attn_impl} compute_dtype={model_dtype} ds_precision={ds_precision_mode} "
-                f"lr={lr} flash_fallback_attempted={flash_fallback_attempted} "
-                f"flash_fallback_succeeded={flash_fallback_succeeded} "
-                f"bad_param_tensors={bad_param_tensors} bad_param_elements={bad_param_elements} "
-                f"bad_param_names={bad_param_names} root_cause_hint={root_hints}"
-            )
-        reduced_loss = _mean_tensor_across_ranks(loss, device=device)
-        last_loss = reduced_loss
+        reduced_loss = _mean_tensor_across_ranks(loss, device)
         opt_loss_sum += reduced_loss
         opt_micro_count += 1
 
-        engine.backward(loss)
         engine.step()
 
         if (step + 1) % grad_accum == 0:
             opt_step = (step + 1) // grad_accum
             opt_loss = opt_loss_sum / max(opt_micro_count, 1)
-            logged_loss = opt_loss
             if rank == 0:
                 print(f"[opt_step {opt_step}] loss={opt_loss:.4f}")
                 if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            "train/loss": opt_loss,
-                            "train/opt_step": opt_step,
-                            "train/micro_step": step + 1,
-                        },
-                        step=opt_step,
-                    )
+                    wandb_run.log({"train/loss": opt_loss, "train/opt_step": opt_step}, step=opt_step)
             opt_loss_sum = 0.0
             opt_micro_count = 0
 
-    tail_micro = getattr(engine, "_micro_steps", 0) % grad_accum
-    if tail_micro != 0:
-        did_tail_flush = _engine_force_step_compat(engine)
-        if did_tail_flush and opt_micro_count > 0:
-            opt_step = (args.steps + grad_accum - 1) // grad_accum
-            opt_loss = opt_loss_sum / opt_micro_count
-            logged_loss = opt_loss
-            if rank == 0:
-                print(f"[opt_step {opt_step}] loss={opt_loss:.4f} (tail_flush {tail_micro}/{grad_accum})")
-                if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            "train/loss": opt_loss,
-                            "train/opt_step": opt_step,
-                            "train/micro_step": args.steps,
-                        },
-                        step=opt_step,
-                    )
-            opt_loss_sum = 0.0
-            opt_micro_count = 0
-        elif rank == 0:
-            print("[warn] engine.step(force=True) is not supported by this DeepSpeed version; tail flush skipped.")
-
-    peak_mem_mb = 0.0
-    peak_reserved_mb = 0.0
-    if device.type == "cuda":
-        peak_mem_mb = float(torch.cuda.max_memory_allocated(device=device) / (1024.0 * 1024.0))
-        peak_reserved_mb = float(torch.cuda.max_memory_reserved(device=device) / (1024.0 * 1024.0))
-    peak_mem_mb = _max_across_ranks(peak_mem_mb, device=device)
-    peak_reserved_mb = _max_across_ranks(peak_reserved_mb, device=device)
-    final_loss = logged_loss if logged_loss is not None else last_loss
-    if rank == 0:
-        metrics = {
-            "ds_impl": "nano",
-            "steps": int(args.steps),
-            "zero_stage": int((ds_cfg.get("zero_optimization", {}) or {}).get("stage", 0)),
-            "peak_mem_mb_max_rank": round(peak_mem_mb, 2),
-            "peak_reserved_mb_max_rank": round(peak_reserved_mb, 2),
-            "dataset_samples": int(len(samples)),
-            "skipped_samples": int(skipped_samples),
-            "last_loss": None if final_loss is None else float(final_loss),
-        }
-        print("[metrics] " + json.dumps(metrics, sort_keys=True))
-        if wandb_run is not None:
-            wandb_run.summary["peak_mem_mb_max_rank"] = round(peak_mem_mb, 2)
-            wandb_run.summary["peak_reserved_mb_max_rank"] = round(peak_reserved_mb, 2)
-            if final_loss is not None:
-                wandb_run.summary["last_loss"] = float(final_loss)
-            wandb_run.finish()
-
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+    if rank == 0 and wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

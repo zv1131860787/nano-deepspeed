@@ -57,13 +57,12 @@
 - PyTorch（建议 CUDA 版本）
 - transformers（用于 Qwen 示例）
 - datasets（用于 `Trainer` 极简脚本）
-- accelerate（`Trainer` + DeepSpeed 运行时依赖）
 - 官方 DeepSpeed（仅在运行 `train_qwen3_zero12_official.py` 时需要）
 
 示例安装：
 
 ```bash
-pip install torch transformers datasets accelerate
+pip install torch transformers
 pip install deepspeed
 ```
 
@@ -73,7 +72,6 @@ pip install deepspeed
 
 - `examples/train_qwen3_zero12_nano.py`：跑本仓库 `nano_deepspeed`
 - `examples/train_qwen3_zero12_official.py`：跑 pip 安装的官方 `deepspeed`
-- `examples/train_qwen3_trainer_official.py`：基于 `transformers.Trainer` + `datasets` + 官方 `deepspeed` 的极简脚本
 
 配置文件：
 
@@ -108,15 +106,6 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
   --deepspeed_config examples/ds_config_zero2_official.json \
   --steps 20
-```
-
-2 卡（official，极简 Trainer）：
-
-```bash
-torchrun --standalone --nproc_per_node=2 examples/train_qwen3_trainer_official.py \
-  --deepspeed-config examples/ds_config_zero2_official.json \
-  --steps 20 --batch-size 4 --grad-accum 2 --seq-len 1024 \
-  --precision bf16 --init-mode config
 ```
 
 ## 7. 严格对齐对比命令（推荐）
