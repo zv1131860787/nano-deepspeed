@@ -6,20 +6,20 @@
     "type": "AdamW",
     "params": {
       "lr": 1e-7,
-      "betas": [0.9, 0.999],
-      "eps": 1e-8,
-      "weight_decay": 0.01
+      "betas": [0.9, 0.95],
+      "eps": 1e-6,
+      "weight_decay": 0.0
     }
   },
 
-  "gradient_clipping": 1.0,
+  "gradient_clipping": 0.5,
 
   "zero_optimization": {
     "stage": 2,
-    "overlap_comm": true,
+    "overlap_comm": false,
     "reduce_scatter": true,
-    "reduce_bucket_size": 4096,
-    "allgather_bucket_size": 4096,
+    "reduce_bucket_size": 50000000,
+    "allgather_bucket_size": 50000000,
     "communication_data_type": "fp32",
     "nccl_start_alignment_factor": 2,
     "stage2_comm_strategy": "official",

@@ -164,7 +164,19 @@ def _infer_prompt_len(full_ids, prompt_ids) -> int:
     return common
 
 
-def _load_sft_samples(dataset_path: str, tokenizer, seq_len: int, max_samples: int = 0):
+def _count_shift_valid_labels(labels) -> int:
+    if len(labels) <= 1:
+        return 0
+    return sum(1 for x in labels[1:] if x != -100)
+
+
+def _load_sft_samples(
+    dataset_path: str,
+    tokenizer,
+    seq_len: int,
+    max_samples: int = 0,
+    min_target_tokens: int = 2,
+):
     with open(dataset_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
@@ -177,6 +189,7 @@ def _load_sft_samples(dataset_path: str, tokenizer, seq_len: int, max_samples: i
         "items_total": len(raw_data),
         "assistant_turns": 0,
         "skipped_all_masked": 0,
+        "skipped_short_target": 0,
     }
 
     for item in raw_data:
@@ -225,6 +238,12 @@ def _load_sft_samples(dataset_path: str, tokenizer, seq_len: int, max_samples: i
                 stats["skipped_all_masked"] += 1
                 continue
 
+            target_tokens = _count_shift_valid_labels(labels)
+            if target_tokens < int(min_target_tokens):
+                skipped += 1
+                stats["skipped_short_target"] += 1
+                continue
+
             samples.append({"input_ids": full_ids, "labels": labels})
             if max_samples > 0 and len(samples) >= max_samples:
                 break
@@ -235,7 +254,9 @@ def _load_sft_samples(dataset_path: str, tokenizer, seq_len: int, max_samples: i
     if not samples:
         raise RuntimeError(
             f"No valid SFT samples built from {dataset_path}. "
-            f"assistant_turns={stats['assistant_turns']} skipped_all_masked={stats['skipped_all_masked']}"
+            f"assistant_turns={stats['assistant_turns']} "
+            f"skipped_all_masked={stats['skipped_all_masked']} "
+            f"skipped_short_target={stats['skipped_short_target']}"
         )
 
     return samples, skipped, stats
@@ -419,6 +440,7 @@ def main():
 
     parser.add_argument("--dataset-path", type=str, default="data/lima.json")
     parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--min-target-tokens", type=int, default=8)
 
     parser.add_argument("--zero-stage", type=int, default=None, choices=[0, 1, 2])
     parser.add_argument("--trust-remote-code", action="store_true")
@@ -470,6 +492,7 @@ def main():
         tokenizer,
         seq_len=args.seq_len,
         max_samples=args.max_samples,
+        min_target_tokens=args.min_target_tokens,
     )
 
     if rank == 0:
@@ -481,7 +504,9 @@ def main():
         print(f"[data] path={args.dataset_path} samples={len(samples)} skipped={skipped_samples}")
         print(
             f"[data] items_total={stats['items_total']} assistant_turns={stats['assistant_turns']} "
-            f"skipped_all_masked={stats['skipped_all_masked']}"
+            f"skipped_all_masked={stats['skipped_all_masked']} "
+            f"skipped_short_target={stats['skipped_short_target']} "
+            f"min_target_tokens={args.min_target_tokens}"
         )
 
     args.deepspeed_config = None
