@@ -58,6 +58,8 @@ def _load_qwen3(args, device: torch.device):
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
     )
+    if hasattr(tokenizer, "truncation_side"):
+        tokenizer.truncation_side = "right"
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token is None:
             raise ValueError(
@@ -146,7 +148,28 @@ def _tokenize_chat(tokenizer, messages, *, seq_len: int, add_generation_prompt: 
     return list(encoded["input_ids"])
 
 
-def _load_sft_samples(dataset_path: str, tokenizer, *, seq_len: int, max_samples: int = 0):
+def _infer_prompt_len(full_ids, prompt_ids):
+    if not full_ids or not prompt_ids:
+        return 0, "empty"
+    if len(full_ids) >= len(prompt_ids) and full_ids[: len(prompt_ids)] == prompt_ids:
+        return len(prompt_ids), "prefix"
+
+    # Fallback when tokenizer truncation/template behavior breaks strict prefix matching.
+    common = 0
+    upper = min(len(full_ids), len(prompt_ids))
+    while common < upper and full_ids[common] == prompt_ids[common]:
+        common += 1
+    return common, "common_prefix"
+
+
+def _load_sft_samples(
+    dataset_path: str,
+    tokenizer,
+    *,
+    seq_len: int,
+    max_samples: int = 0,
+    return_stats: bool = False,
+):
     with open(dataset_path, "r", encoding="utf-8") as f:
         raw_data = json.load(f)
 
@@ -155,12 +178,22 @@ def _load_sft_samples(dataset_path: str, tokenizer, *, seq_len: int, max_samples
 
     samples = []
     skipped = 0
+    stats = {
+        "items_total": len(raw_data),
+        "items_kept": 0,
+        "messages_kept": 0,
+        "assistant_turns": 0,
+        "prompt_alignment_common_prefix": 0,
+        "skipped_empty_full_ids": 0,
+        "skipped_all_masked": 0,
+    }
     for item in raw_data:
         if not isinstance(item, dict):
             continue
         turns = item.get("conversations")
         if not isinstance(turns, list):
             continue
+        stats["items_kept"] += 1
 
         messages = []
         for turn in turns:
@@ -174,10 +207,12 @@ def _load_sft_samples(dataset_path: str, tokenizer, *, seq_len: int, max_samples
             if not content:
                 continue
             messages.append({"role": role, "content": content})
+        stats["messages_kept"] += len(messages)
 
         for idx, msg in enumerate(messages):
             if msg["role"] != "assistant" or idx == 0:
                 continue
+            stats["assistant_turns"] += 1
 
             prompt_messages = messages[:idx]
             full_messages = messages[: idx + 1]
@@ -197,26 +232,44 @@ def _load_sft_samples(dataset_path: str, tokenizer, *, seq_len: int, max_samples
 
             if not full_ids:
                 skipped += 1
+                stats["skipped_empty_full_ids"] += 1
                 continue
 
-            prompt_len = min(len(prompt_ids), len(full_ids))
+            prompt_len, align_mode = _infer_prompt_len(full_ids, prompt_ids)
+            if align_mode == "common_prefix":
+                stats["prompt_alignment_common_prefix"] += 1
             labels = list(full_ids)
             for pos in range(prompt_len):
                 labels[pos] = -100
 
             if not any(token != -100 for token in labels):
                 skipped += 1
+                stats["skipped_all_masked"] += 1
                 continue
 
             samples.append({"input_ids": full_ids, "labels": labels})
             if max_samples > 0 and len(samples) >= max_samples:
+                if return_stats:
+                    return samples, skipped, stats
                 return samples, skipped
 
     if not samples:
+        detail = (
+            f"items_total={stats['items_total']} "
+            f"items_kept={stats['items_kept']} "
+            f"messages_kept={stats['messages_kept']} "
+            f"assistant_turns={stats['assistant_turns']} "
+            f"skipped_empty_full_ids={stats['skipped_empty_full_ids']} "
+            f"skipped_all_masked={stats['skipped_all_masked']} "
+            f"prompt_alignment_common_prefix={stats['prompt_alignment_common_prefix']}"
+        )
         raise RuntimeError(
             f"No valid SFT samples were built from {dataset_path}. "
-            "Check dataset schema or increase --seq-len."
+            "Check dataset schema or increase --seq-len. "
+            f"SFT stats: {detail}"
         )
+    if return_stats:
+        return samples, skipped, stats
     return samples, skipped
 
 
@@ -417,17 +470,28 @@ def main():
         ds_cfg["zero_optimization"]["stage"] = int(args.zero_stage)
 
     model, tokenizer, model_dtype = _load_qwen3(args, device)
-    samples, skipped_samples = _load_sft_samples(
+    samples, skipped_samples, sft_stats = _load_sft_samples(
         args.dataset_path,
         tokenizer,
         seq_len=args.seq_len,
         max_samples=args.max_samples,
+        return_stats=True,
     )
     if rank == 0:
         ds_file = str(Path(getattr(ds, "__file__", "unknown")).resolve())
         print(f"[deepspeed] impl=nano module={ds_file}")
         print(f"[model] loaded {args.model_name} on {device} (param_dtype={model_dtype})")
         print(f"[data] path={args.dataset_path} samples={len(samples)} skipped={skipped_samples}")
+        print(
+            "[data] sft_stats "
+            f"items_total={sft_stats['items_total']} "
+            f"items_kept={sft_stats['items_kept']} "
+            f"messages_kept={sft_stats['messages_kept']} "
+            f"assistant_turns={sft_stats['assistant_turns']} "
+            f"skipped_empty_full_ids={sft_stats['skipped_empty_full_ids']} "
+            f"skipped_all_masked={sft_stats['skipped_all_masked']} "
+            f"prompt_alignment_common_prefix={sft_stats['prompt_alignment_common_prefix']}"
+        )
 
     engine, _, _, _ = ds.initialize(
         args=args,
