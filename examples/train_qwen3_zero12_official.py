@@ -19,6 +19,34 @@ def _dist_required() -> bool:
     return False
 
 
+def _resolve_user_path(path_value: str, script_dir: Path) -> str:
+    p = Path(path_value)
+    if p.is_absolute():
+        return str(p)
+
+    candidates = [
+        Path.cwd() / p,
+        script_dir / p,
+        script_dir.parent / p,
+    ]
+    if p.parts and p.parts[0] == script_dir.name:
+        if len(p.parts) > 1:
+            candidates.append(script_dir / Path(*p.parts[1:]))
+        candidates.append(script_dir.parent / Path(*p.parts))
+
+    seen = set()
+    for cand in candidates:
+        c = cand.resolve()
+        key = str(c)
+        if key in seen:
+            continue
+        seen.add(key)
+        if c.exists():
+            return key
+
+    return str((script_dir / p).resolve())
+
+
 def _resolve_model_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
     name = str(dtype_name).strip().lower()
     if name == "float32":
@@ -445,11 +473,10 @@ def main():
     script_dir = Path(__file__).resolve().parent
     if args.deepspeed_config is None:
         args.deepspeed_config = str(script_dir / "ds_config_zero2_official.json")
-    elif not os.path.isabs(args.deepspeed_config) and not os.path.exists(args.deepspeed_config):
-        args.deepspeed_config = str(script_dir / args.deepspeed_config)
+    else:
+        args.deepspeed_config = _resolve_user_path(args.deepspeed_config, script_dir)
 
-    if not os.path.isabs(args.dataset_path) and not os.path.exists(args.dataset_path):
-        args.dataset_path = str(script_dir / args.dataset_path)
+    args.dataset_path = _resolve_user_path(args.dataset_path, script_dir)
 
     dist_required = _dist_required()
     if dist_required:
