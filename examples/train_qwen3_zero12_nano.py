@@ -45,7 +45,7 @@ def _resolve_model_dtype(dtype_name: str, device: torch.device) -> torch.dtype:
 
 def _load_qwen3(args, device: torch.device):
     try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     except ImportError as exc:
         raise RuntimeError(
             "This example requires `transformers`. Install it first, e.g. `pip install transformers`."
@@ -67,17 +67,20 @@ def _load_qwen3(args, device: torch.device):
             )
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model_config = AutoConfig.from_pretrained(
         args.model_name,
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
-        torch_dtype=model_dtype,
+    )
+    model = AutoModelForCausalLM.from_config(
+        model_config,
+        trust_remote_code=args.trust_remote_code,
     )
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
-    model.to(device)
+    model.to(device=device, dtype=model_dtype)
     model.train()
     return model, tokenizer, model_dtype
 
@@ -505,7 +508,7 @@ def main():
     if rank == 0:
         ds_file = str(Path(getattr(ds, "__file__", "unknown")).resolve())
         print(f"[deepspeed] impl=nano module={ds_file}")
-        print(f"[model] loaded {args.model_name} on {device} (param_dtype={model_dtype})")
+        print(f"[model] initialized {args.model_name} from config on {device} (param_dtype={model_dtype})")
         print(f"[data] path={args.dataset_path} samples={len(samples)} skipped={skipped_samples}")
         print(
             "[data] sft_stats "
