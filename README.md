@@ -89,7 +89,7 @@ pip install deepspeed
 ```bash
 python3 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config examples/ds_config_zero2.json \
-  --steps 5 --batch-size 1 --seq-len 128
+  --steps 100 --batch-size 1 --seq-len 512
 ```
 
 2 卡（nano）：
@@ -97,7 +97,7 @@ python3 examples/train_qwen3_zero12_nano.py \
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config examples/ds_config_zero2.json \
-  --steps 20
+  --steps 100 --seq-len 512
 ```
 
 2 卡（official）：
@@ -105,7 +105,7 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
   --deepspeed_config examples/ds_config_zero2_official.json \
-  --steps 20
+  --steps 100 --seq-len 512
 ```
 
 ## 7. 严格对齐对比命令（推荐）
@@ -125,11 +125,11 @@ torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py
 # 正式对比
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
-  --batch-size 1 --seq-len 128 --steps 20 | tee nano.log
+  --batch-size 1 --seq-len 512 --steps 100 | tee nano.log
 
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
   --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
-  --batch-size 1 --seq-len 128 --steps 20 | tee official.log
+  --batch-size 1 --seq-len 512 --steps 100 | tee official.log
 
 grep "\\[metrics\\]" nano.log official.log
 ```
