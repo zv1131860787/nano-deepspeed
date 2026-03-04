@@ -477,8 +477,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser = ds.add_config_arguments(parser)
 
-    parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
 

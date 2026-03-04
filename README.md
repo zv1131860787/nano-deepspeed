@@ -1,25 +1,32 @@
 # nano-deepspeed (Teaching Edition)
 
-这是一个教学版 DeepSpeed 复刻项目，目标是帮助你理解 ZeRO 训练的核心数据流和通信流程，而不是替代官方 DeepSpeed 做生产训练。
+English is the default documentation for this repository.
 
-## 1. 项目定位
+For Chinese documentation, see [README.zh-CN.md](README.zh-CN.md).
 
-- 定位：教学、源码阅读、机制验证。
-- 目标：代码可读、行为可解释、便于和官方做小规模对比。
-- 非目标：覆盖官方 DeepSpeed 全部能力和工程优化。
+This project is a teaching-oriented re-implementation of DeepSpeed ZeRO. The goal is to help you understand ZeRO data flow and communication behavior, not to replace official DeepSpeed in production.
 
-一句话：这是一个“能跑、能看懂、能对比”的 ZeRO 教学实现。
+## 1. Project Scope
 
-## 2. 当前功能范围
+- Positioning: teaching, source-code reading, mechanism verification.
+- Goal: readable code, explainable behavior, and easy small-scale comparison with official DeepSpeed.
+- Non-goal: full feature parity and full engineering optimization of official DeepSpeed.
 
-- 支持 ZeRO stage：`0/1/2`
-- 不支持：`stage 3`
-- 优化器：仅 `AdamW`
-- 精度：支持 FP16 动态 loss scaler；支持 bf16/autocast 路径
-- 通信：stage2 为教学实现（`packed + all_reduce + local scatter-back`）
-- 入口兼容：提供 `nano_deepspeed.initialize(...)`、`init_distributed(...)`、`add_config_arguments(...)`
+In one sentence: a ZeRO teaching implementation that you can run, read, and compare.
 
-核心代码：
+## 2. Current Feature Range
+
+- Supported ZeRO stages: `0/1/2`
+- Not supported: `stage 3`
+- Optimizer: `AdamW` only
+- Precision: FP16 dynamic loss scaling and bf16/autocast path
+- Communication: stage2 teaching implementation (`packed + all_reduce + local scatter-back`)
+- API compatibility entry points:
+  - `nano_deepspeed.initialize(...)`
+  - `init_distributed(...)`
+  - `add_config_arguments(...)`
+
+Core files:
 
 - `nano_deepspeed/api.py`
 - `nano_deepspeed/engine.py`
@@ -27,7 +34,7 @@
 - `nano_deepspeed/zero_reducer.py`
 - `nano_deepspeed/fp16_scaler.py`
 
-## 3. 目录结构
+## 3. Repository Layout
 
 ```text
 .
@@ -51,90 +58,90 @@
     └── train_qwen3_zero12_official.py
 ```
 
-## 4. 环境要求
+## 4. Requirements
 
 - Python 3.9+
-- PyTorch（建议 CUDA 版本）
-- transformers（用于 Qwen 示例）
-- datasets（用于 `Trainer` 极简脚本）
-- 官方 DeepSpeed（仅在运行 `train_qwen3_zero12_official.py` 时需要）
+- PyTorch (CUDA build recommended)
+- transformers (for Qwen example)
+- official DeepSpeed (required only for `train_qwen3_zero12_official.py`)
 
-示例安装：
+Example installation:
 
 ```bash
 pip install torch transformers
 pip install deepspeed
 ```
 
-## 5. 脚本与配置
+## 5. Scripts and Configs
 
-训练脚本：
+Training scripts:
 
-- `examples/train_qwen3_zero12_nano.py`：跑本仓库 `nano_deepspeed`
-- `examples/train_qwen3_zero12_official.py`：跑 pip 安装的官方 `deepspeed`
+- `examples/train_qwen3_zero12_nano.py`: runs this repo's `nano_deepspeed`
+- `examples/train_qwen3_zero12_official.py`: runs pip-installed official `deepspeed`
 
-配置文件：
+Config files:
 
-- `examples/ds_config_zero2.json`：nano 默认教学配置（含 nano 自定义字段）
-- `examples/ds_config_zero2_official.json`：官方可接受配置（去掉官方不接受的字段）
+- `examples/ds_config_zero2.json`: default teaching config for nano (contains nano-specific fields)
+- `examples/ds_config_zero2_official.json`: official-compatible config (nano-only fields removed)
 
-重要说明：
+Important:
 
-- 官方脚本请优先传 `ds_config_zero2_official.json`，否则可能报 `ValidationError: extra_forbidden`。
+- Use `ds_config_zero2_official.json` for the official script, otherwise you may hit `ValidationError: extra_forbidden`.
 
-## 6. 快速开始
+## 6. Quick Start
 
-单卡（nano）：
+Single GPU (nano):
 
 ```bash
 python3 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config examples/ds_config_zero2.json \
-  --steps 100 --batch-size 1 --seq-len 512
+  --steps 50 --batch-size 1 --seq-len 512
 ```
 
-2 卡（nano）：
+2 GPUs (nano):
 
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
   --deepspeed_config examples/ds_config_zero2.json \
-  --steps 100 --seq-len 512
+  --steps 50 --seq-len 512
 ```
 
-2 卡（official）：
+2 GPUs (official):
 
 ```bash
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
   --deepspeed_config examples/ds_config_zero2_official.json \
-  --steps 100 --seq-len 512
+  --steps 50 --seq-len 512
 ```
 
-## 7. 严格对齐对比命令（推荐）
+## 7. Recommended Side-by-Side Commands
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
-CONF=examples/ds_config_zero2_official.json
+NANO_CONF=examples/ds_config_zero2.json
+OFFICIAL_CONF=examples/ds_config_zero2_official.json
 MODEL=/root/autodl-tmp/pretrained_models/Qwen3-0.6B
 
-# 可选 warmup，减少首次编译/JIT 影响
+# Optional warmup to reduce first-time compile/JIT effects
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
-  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 --steps 2 >/dev/null
+  --deepspeed_config $NANO_CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 --steps 2 >/dev/null
 
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
-  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 --steps 2 >/dev/null
+  --deepspeed_config $OFFICIAL_CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 --steps 2 >/dev/null
 
-# 正式对比
+# Main run
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
-  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
-  --batch-size 1 --seq-len 512 --steps 100 | tee nano.log
+  --deepspeed_config $NANO_CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
+  --batch-size 1 --seq-len 512 --steps 50 | tee nano.log
 
 torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_official.py \
-  --deepspeed_config $CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
-  --batch-size 1 --seq-len 512 --steps 100 | tee official.log
+  --deepspeed_config $OFFICIAL_CONF --model-name $MODEL --model-dtype bfloat16 --seed 42 \
+  --batch-size 1 --seq-len 512 --steps 50 | tee official.log
 
-grep "\\[metrics\\]" nano.log official.log
+grep "\\[opt_step" nano.log official.log
 ```
 
-8 卡运行前建议先确认可见卡数：
+Before 8-GPU runs, verify visible GPU count first:
 
 ```bash
 python3 - <<'PY'
@@ -143,98 +150,113 @@ print(torch.cuda.device_count())
 PY
 ```
 
-`--nproc_per_node` 必须小于等于可见 GPU 数，否则会报 `invalid device ordinal`。
+`--nproc_per_node` must be less than or equal to visible GPU count, otherwise `invalid device ordinal` will occur.
 
-## 8. 指标解释
+## 8. Log Field Reference
 
-日志会输出：
+The scripts currently output these key fields:
 
-- `ds_impl`：`nano` 或 `official`
-- `steps`：总 step 数
-- `zero_stage`：ZeRO stage
-- `last_loss`：最后一个 step 的 loss（不是全程平均）
-- `peak_mem_mb_max_rank`：所有 rank 中最大的 `max_memory_allocated`（已分配峰值）
-- `peak_reserved_mb_max_rank`：所有 rank 中最大的 `max_memory_reserved`（缓存池保留峰值）
+- `[zero]`: ZeRO runtime config (`stage/reduce_scatter/bucket/communication_data_type`)
+- `[model]`: precision info (`param_dtype/compute_dtype/ds_precision`)
+- `[opt_step k]`: training stats (`loss/cuda_alloc_max_mb/cuda_reserved_max_mb/cuda_peak_alloc_max_mb/cuda_peak_reserved_max_mb`)
 
-关系：
+Memory relationship:
 
-- 一般 `reserved >= allocated`
-- `reserved - allocated` 近似是缓存池中暂未被 tensor 使用但未归还驱动的空间
+- Usually `reserved >= allocated`
+- `reserved - allocated` approximates memory kept in CUDA caching allocator but not actively occupied by tensors
 
-## 9. 实测结果（RTX 4090D）
+## 9. Experimental Results (from `log/`, 2026-03-04)
 
-硬件：
+Source logs:
 
-- GPU: NVIDIA GeForce RTX 4090D
+- `log/nano-node2.log`
+- `log/official-node2.log`
+- `log/nano-node8.log`
+- `log/official-node8.log`
 
-2 卡（ZeRO-2, steps=20）：
+Shared conditions (read from log headers):
 
-| impl | last_loss | peak_mem_mb_max_rank | peak_reserved_mb_max_rank |
-|---|---:|---:|---:|
-| nano | 4.5282979011535645 | 10091.36 | 12950.0 |
-| official | 9.645814895629883 | 8660.97 | 11626.0 |
+- GPU: NVIDIA GeForce RTX 4090 D
+- `param_dtype=torch.bfloat16`
+- `compute_dtype=torch.bfloat16`
+- `opt_step=50` in logs (equivalent to 100 micro steps with `gradient_accumulation_steps=2`)
+- Config differences in this run:
+  - nano: `reduce_scatter=False` + `communication_data_type=bf16`
+  - official: `reduce_scatter=True` + `communication_data_type=auto`
 
-2 卡差值（nano - official）：
+2 GPUs (node2):
 
-- allocated 峰值：`+1430.39 MB`（约 `+16.5%`）
-- reserved 峰值：`+1324.00 MB`（约 `+11.4%`）
+| impl | last_loss | alloc_max_mb | reserved_max_mb | peak_alloc_max_mb | peak_reserved_max_mb |
+|---|---:|---:|---:|---:|---:|
+| nano | 2.7722 | 7337.0 | 13718.0 | 10264.2 | 13718.0 |
+| official | 2.7738 | 5901.5 | 12750.0 | 9377.1 | 12750.0 |
 
-8 卡（ZeRO-2, steps=20）：
+2-GPU delta (nano - official):
 
-| impl | last_loss | peak_mem_mb_max_rank | peak_reserved_mb_max_rank |
-|---|---:|---:|---:|
-| nano | 4.065056800842285 | 4713.4 | 7228.0 |
-| official | 5.152425289154053 | 3943.27 | 5712.0 |
+- `alloc_max_mb`: `+1435.5 MB` (about `+24.3%`)
+- `peak_alloc_max_mb`: `+887.1 MB` (about `+9.46%`)
+- `reserved_max_mb`: `+968.0 MB` (about `+7.59%`)
+- `last_loss` delta: `-0.0016`
 
-8 卡差值（nano - official）：
+8 GPUs (node8):
 
-- allocated 峰值：`+770.13 MB`（约 `+19.5%`）
-- reserved 峰值：`+1516.00 MB`（约 `+26.5%`）
+| impl | last_loss | alloc_max_mb | reserved_max_mb | peak_alloc_max_mb | peak_reserved_max_mb |
+|---|---:|---:|---:|---:|---:|
+| nano | 2.6393 | 3034.2 | 8376.0 | 5724.8 | 8376.0 |
+| official | 2.6398 | 2673.9 | 7104.0 | 5663.4 | 7104.0 |
 
-结论：
+8-GPU delta (nano - official):
 
-- 在这组实验条件下，官方 DeepSpeed 的显存峰值更低。
-- `last_loss` 仅用于确认训练流程在跑通，不用于跨实现严格数值对齐结论。
+- `alloc_max_mb`: `+360.3 MB` (about `+13.5%`)
+- `peak_alloc_max_mb`: `+61.4 MB` (about `+1.08%`)
+- `reserved_max_mb`: `+1272.0 MB` (about `+17.9%`)
+- `last_loss` delta: `-0.0005`
 
-## 10. 为什么官方显存更低
+Conclusions:
 
-主要原因是实现策略差异：
+- All four runs completed stably (no `warn/non-finite/traceback`).
+- Under this configuration, nano still uses more memory (`allocated` and `reserved`) than official.
+- Final losses are very close, indicating both runs are stable and in a similar convergence band.
 
-- nano 的 stage2 当前是教学路径，不是官方完整工程路径
-- 临时缓冲与通信打包策略更保守，峰值更容易抬高
-- 官方在通信、内存复用、调度上有更多工程优化
+## 10. Why Official Uses Less Memory
 
-## 11. 与官方 DeepSpeed 的差距
+Main reasons are implementation strategy differences:
 
-- 不支持 ZeRO-3
-- 不支持 offload（optimizer/parameter）
-- 缺少大量官方生态能力（MoE、pipeline/tensor 并行全链路、AIO 等）
-- 工程化能力简化（容错、性能调优、极端规模稳定性）
+- nano stage2 is still a teaching path, not the full official engineering path
+- temporary buffer and communication packing are more conservative, which increases peaks
+- official implementation includes more optimization in communication, memory reuse, and scheduling
 
-## 12. 路线图
+## 11. Gaps vs Official DeepSpeed
 
-- v0.2：ZeRO-2 路径继续收敛，补齐可观测性与对比工具
-- v0.3：ZeRO-3 教学版首发（最小可运行主线）
-- v0.4：offload 教学版首发
-- v0.5：测试、checkpoint、文档一致性与差异矩阵收敛
+- No ZeRO-3
+- No offload (optimizer/parameter)
+- Missing many official ecosystem capabilities (MoE, full pipeline/tensor-parallel integration, AIO, etc.)
+- Simpler engineering robustness (fault tolerance, performance tuning, extreme-scale stability)
 
-## 13. 常见报错
+## 12. Roadmap
 
-`ValidationError: extra_forbidden`（官方脚本）：
+- v0.2: keep improving ZeRO-2 path, add observability and comparison tooling
+- v0.3: first release of teaching ZeRO-3 minimal runnable path
+- v0.4: first release of teaching offload path
+- v0.5: improve tests, checkpoint consistency, and documentation consistency
 
-- 原因：用了 nano 配置里的自定义字段
-- 解决：使用 `examples/ds_config_zero2_official.json`
+## 13. Common Errors
 
-`CUDA error: invalid device ordinal`：
+`ValidationError: extra_forbidden` (official script):
 
-- 原因：`--nproc_per_node` 大于可见 GPU 数
-- 解决：把 `--nproc_per_node` 调整为可见卡数，或正确设置 `CUDA_VISIBLE_DEVICES`
+- Cause: using nano-only fields in config
+- Fix: use `examples/ds_config_zero2_official.json`
 
-`DeepSpeedEngine.zero_grad() got an unexpected keyword argument 'set_to_none'`：
+`CUDA error: invalid device ordinal`:
 
-- 这是不同官方版本 API 差异导致
-- 当前 `train_qwen3_zero12_official.py` 已做兼容回退处理
+- Cause: `--nproc_per_node` is larger than visible GPU count
+- Fix: reduce `--nproc_per_node` or set `CUDA_VISIBLE_DEVICES` correctly
 
-## 14. 声明
+`DeepSpeedEngine.zero_grad() got an unexpected keyword argument 'set_to_none'`:
 
-本项目用于学习与研究。生产环境请优先使用官方 DeepSpeed。
+- Cause: API differences across official DeepSpeed versions
+- Current script already has compatibility fallback
+
+## 14. Disclaimer
+
+This project is for learning and research. For production workloads, use official DeepSpeed first.

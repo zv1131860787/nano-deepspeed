@@ -52,3 +52,5 @@ events.out.tfevents.*
 *.pth
 *.bin
 *.safetensors
+
+log
