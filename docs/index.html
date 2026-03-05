@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nano-deepspeed | ZeRO Teaching Edition</title>
+  <meta name="description" content="nano-deepspeed: teaching-oriented DeepSpeed ZeRO re-implementation with ZeRO-0/1/2, FP16 scaler, BF16 autocast, and official side-by-side comparisons.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f1f2eb;
+      --paper: #fbfbf8;
+      --card: #ffffff;
+      --ink: #171d1f;
+      --muted: #5a6469;
+      --line: #d9dcd2;
+      --brand: #0d7f72;
+      --accent: #dd6b20;
+      --soft: #e7f9f5;
+      --soft-2: #fff0e4;
+      --shadow: 0 24px 48px rgba(23, 29, 31, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at 8% -20%, #ffd8b4 0%, rgba(255, 216, 180, 0) 55%),
+        radial-gradient(circle at 102% -8%, #cbf3ea 0%, rgba(203, 243, 234, 0) 50%),
+        linear-gradient(180deg, #f8f9f4 0%, var(--bg) 100%);
+      line-height: 1.6;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: -40vmax;
+      background:
+        radial-gradient(circle at 40% 60%, rgba(13, 127, 114, 0.08), transparent 45%),
+        radial-gradient(circle at 70% 30%, rgba(221, 107, 32, 0.09), transparent 38%);
+      animation: drift 20s ease-in-out infinite alternate;
+      z-index: -1;
+    }
+
+    @keyframes drift {
+      from {
+        transform: translate3d(-2%, -1.5%, 0) scale(1);
+      }
+      to {
+        transform: translate3d(2%, 1.2%, 0) scale(1.04);
+      }
+    }
+
+    .wrap {
+      width: min(1100px, calc(100% - 2rem));
+      margin: 0 auto;
+      padding: 1.5rem 0 3rem;
+    }
+
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+      opacity: 0;
+      transform: translateY(8px);
+      animation: rise 0.6s ease forwards;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.32rem 0.65rem;
+      border-radius: 999px;
+      border: 1px solid #a6e3d9;
+      background: var(--soft);
+      color: #06695f;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.75rem;
+      letter-spacing: 0.02em;
+    }
+
+    .top-links {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .top-links a {
+      color: #284149;
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 0.34rem 0.58rem;
+      background: rgba(255, 255, 255, 0.75);
+      font-size: 0.82rem;
+      font-weight: 500;
+    }
+
+    .hero {
+      background: linear-gradient(160deg, rgba(255, 255, 255, 0.95), rgba(250, 251, 246, 0.92));
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      box-shadow: var(--shadow);
+      padding: 1.3rem;
+      display: grid;
+      gap: 1rem;
+      opacity: 0;
+      transform: translateY(10px);
+      animation: rise 0.7s ease 0.08s forwards;
+    }
+
+    .hero h1 {
+      margin: 0;
+      font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      font-size: clamp(2rem, 1.4rem + 3vw, 3.25rem);
+      line-height: 1.03;
+    }
+
+    .hero .subtitle {
+      margin: 0.55rem 0 0;
+      color: var(--muted);
+      max-width: 68ch;
+    }
+
+    .hero-grid {
+      display: grid;
+      gap: 0.9rem;
+      grid-template-columns: 1fr;
+    }
+
+    .hero-panel {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 0.9rem;
+    }
+
+    .hero-panel h2 {
+      margin: 0;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 1rem;
+    }
+
+    .hero-panel p {
+      margin: 0.45rem 0 0;
+      color: var(--muted);
+      font-size: 0.93rem;
+    }
+
+    .metric-row {
+      display: flex;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+      margin-top: 0.65rem;
+    }
+
+    .metric {
+      padding: 0.4rem 0.56rem;
+      border-radius: 10px;
+      background: var(--soft-2);
+      border: 1px solid #ffd9bd;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.78rem;
+    }
+
+    .actions {
+      display: flex;
+      gap: 0.55rem;
+      flex-wrap: wrap;
+      margin-top: 0.9rem;
+    }
+
+    .btn {
+      text-decoration: none;
+      border-radius: 10px;
+      padding: 0.56rem 0.9rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      border: 1px solid transparent;
+      transition: transform 0.18s ease, box-shadow 0.18s ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+    }
+
+    .btn-primary {
+      color: #fff;
+      background: linear-gradient(100deg, #0c7b6f, #12a38d);
+      box-shadow: 0 10px 18px rgba(13, 127, 114, 0.22);
+    }
+
+    .btn-secondary {
+      color: #22353b;
+      border-color: var(--line);
+      background: rgba(255, 255, 255, 0.85);
+    }
+
+    .section {
+      margin-top: 1rem;
+      opacity: 0;
+      transform: translateY(14px);
+      animation: rise 0.65s ease forwards;
+    }
+
+    .section:nth-of-type(3) {
+      animation-delay: 0.14s;
+    }
+
+    .section:nth-of-type(4) {
+      animation-delay: 0.2s;
+    }
+
+    .section:nth-of-type(5) {
+      animation-delay: 0.26s;
+    }
+
+    .card {
+      background: rgba(255, 255, 255, 0.9);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      padding: 1rem;
+    }
+
+    .card h3 {
+      margin: 0;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: 1.16rem;
+      letter-spacing: -0.01em;
+    }
+
+    .sub {
+      margin: 0.38rem 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .feature-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 0.65rem;
+      margin-top: 0.8rem;
+    }
+
+    .feature {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 0.72rem 0.78rem;
+      background: var(--paper);
+    }
+
+    .feature strong {
+      display: block;
+      font-size: 0.94rem;
+      margin-bottom: 0.2rem;
+    }
+
+    .feature span {
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    .bench {
+      margin-top: 0.82rem;
+      display: grid;
+      gap: 0.85rem;
+    }
+
+    .bar-box {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--paper);
+      padding: 0.72rem;
+    }
+
+    .bar-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 0.6rem;
+      margin-bottom: 0.48rem;
+      font-size: 0.85rem;
+      color: #3e4d53;
+    }
+
+    .bar-head strong {
+      font-family: "IBM Plex Mono", monospace;
+      color: #0f4f49;
+    }
+
+    .track {
+      width: 100%;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #e8ede6;
+      height: 11px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px;
+    }
+
+    .bar {
+      position: relative;
+      height: 100%;
+      transform-origin: left center;
+      animation: fill 1s ease forwards;
+    }
+
+    .bar.nano {
+      width: 100%;
+      background: linear-gradient(90deg, #c64f12, #dd6b20);
+    }
+
+    .bar.official {
+      width: 100%;
+      background: linear-gradient(90deg, #0f7c73, #1c9f8f);
+    }
+
+    @keyframes fill {
+      from {
+        transform: scaleX(0.06);
+      }
+      to {
+        transform: scaleX(1);
+      }
+    }
+
+    .table-like {
+      margin-top: 0.82rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      background: var(--paper);
+      font-size: 0.86rem;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr;
+      padding: 0.58rem 0.72rem;
+      border-top: 1px solid var(--line);
+    }
+
+    .row:first-child {
+      border-top: 0;
+      font-weight: 600;
+      color: #26353c;
+      background: #f3f7f4;
+    }
+
+    .mono {
+      font-family: "IBM Plex Mono", monospace;
+    }
+
+    .note {
+      margin-top: 0.75rem;
+      padding: 0.65rem 0.72rem;
+      border-radius: 10px;
+      background: #f1faf8;
+      border: 1px solid #cdece5;
+      color: #31534d;
+      font-size: 0.86rem;
+    }
+
+    .code {
+      margin-top: 0.8rem;
+      border-radius: 12px;
+      background: #111517;
+      color: #d9e3e5;
+      border: 1px solid #273035;
+      padding: 0.72rem;
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.77rem;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .footer {
+      margin-top: 1rem;
+      color: #5d686d;
+      font-size: 0.82rem;
+      text-align: center;
+    }
+
+    @keyframes rise {
+      from {
+        opacity: 0;
+        transform: translateY(10px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    @media (min-width: 900px) {
+      .wrap {
+        padding-top: 2rem;
+      }
+
+      .hero {
+        padding: 1.7rem;
+      }
+
+      .hero-grid {
+        grid-template-columns: 1.3fr 0.9fr;
+      }
+
+      .card {
+        padding: 1.15rem 1.2rem;
+      }
+
+      .feature-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="topbar">
+      <span class="badge">TEACHING EDITION</span>
+      <nav class="top-links">
+        <a href="https://github.com/zv1131860787/nano-deepspeed" target="_blank" rel="noreferrer">GitHub</a>
+        <a href="https://github.com/zv1131860787/nano-deepspeed/blob/master/README.md" target="_blank" rel="noreferrer">README (EN)</a>
+        <a href="https://github.com/zv1131860787/nano-deepspeed/blob/master/README.zh-CN.md" target="_blank" rel="noreferrer">README (ZH)</a>
+      </nav>
+    </header>
+
+    <section class="hero">
+      <div class="hero-grid">
+        <div>
+          <h1>nano-deepspeed</h1>
+          <p class="subtitle">一个可运行、可阅读、可对比的 DeepSpeed ZeRO 教学复线项目，聚焦核心数据流和通信机制，而不是生产替代。</p>
+          <div class="actions">
+            <a class="btn btn-primary" href="https://github.com/zv1131860787/nano-deepspeed" target="_blank" rel="noreferrer">查看仓库</a>
+            <a class="btn btn-secondary" href="#benchmarks">看实验结果</a>
+          </div>
+        </div>
+
+        <aside class="hero-panel">
+          <h2>一句话简历描述</h2>
+          <p>复线官方 DeepSpeed 的 <span class="mono">initialize / init_distributed</span>、ZeRO-0/1/2、FP16 动态 loss scaling 与 BF16 autocast，并完成 Qwen3-0.6B 的多卡对齐实验。</p>
+          <div class="metric-row">
+            <span class="metric">2 卡差值: 9.46%</span>
+            <span class="metric">8 卡差值: 1.08%</span>
+            <span class="metric">50 opt steps</span>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section card">
+      <h3>已复线能力</h3>
+      <p class="sub">当前范围聚焦 ZeRO 主路径，明确声明不覆盖 ZeRO-3 与 offload。</p>
+      <div class="feature-grid">
+        <article class="feature">
+          <strong>ZeRO Stage 0/1/2</strong>
+          <span>包含参数/梯度分片与 stage2 reducer 路径。</span>
+        </article>
+        <article class="feature">
+          <strong>API 兼容入口</strong>
+          <span><span class="mono">initialize</span> / <span class="mono">init_distributed</span> / <span class="mono">add_config_arguments</span>。</span>
+        </article>
+        <article class="feature">
+          <strong>精度与稳定性</strong>
+          <span>FP16 动态 loss scaling，BF16 autocast 训练路径。</span>
+        </article>
+        <article class="feature">
+          <strong>官方对齐脚本</strong>
+          <span>同数据、同模型、同步数，直接对比 nano 与 official 指标。</span>
+        </article>
+      </div>
+    </section>
+
+    <section id="benchmarks" class="section card">
+      <h3>显存对比快照</h3>
+      <p class="sub">Qwen3-0.6B，bf16，opt_step=50，口径为日志中的 <span class="mono">cuda_peak_alloc_max_mb</span>。</p>
+
+      <div class="bench">
+        <div class="bar-box">
+          <div class="bar-head">
+            <span>2 GPUs</span>
+            <strong>Nano 10264.2 MB vs Official 9377.1 MB</strong>
+          </div>
+          <div class="track">
+            <div class="bar nano"></div>
+            <div class="bar official"></div>
+          </div>
+        </div>
+
+        <div class="bar-box">
+          <div class="bar-head">
+            <span>8 GPUs</span>
+            <strong>Nano 5724.8 MB vs Official 5663.4 MB</strong>
+          </div>
+          <div class="track">
+            <div class="bar nano"></div>
+            <div class="bar official"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-like">
+        <div class="row">
+          <span>Case</span>
+          <span>Peak Alloc Gap</span>
+          <span>Peak Reserved Gap</span>
+        </div>
+        <div class="row">
+          <span>2 GPUs</span>
+          <span class="mono">+9.46%</span>
+          <span class="mono">+7.59%</span>
+        </div>
+        <div class="row">
+          <span>8 GPUs</span>
+          <span class="mono">+1.08%</span>
+          <span class="mono">+17.9%</span>
+        </div>
+      </div>
+
+      <p class="note">注: <span class="mono">peak_alloc</span> 与 <span class="mono">peak_reserved</span> 口径不同，后者更受缓存池策略影响，趋势不一定一致。</p>
+    </section>
+
+    <section class="section card">
+      <h3>快速运行</h3>
+      <p class="sub">默认使用本仓库教学实现；官方对比脚本见 README。</p>
+      <div class="code">torchrun --standalone --nproc_per_node=2 examples/train_qwen3_zero12_nano.py \
+  --deepspeed_config examples/ds_config_zero2.json \
+  --model-dtype bfloat16 --seed 42 --steps 50</div>
+    </section>
+
+    <footer class="footer">
+      Published with GitHub Pages from the <span class="mono">docs/</span> directory.
+    </footer>
+  </main>
+</body>
+</html>
